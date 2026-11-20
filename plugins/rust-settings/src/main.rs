@@ -55,6 +55,7 @@ enum Row {
     Slider(String, audio::Src),
     /// A row that does `Cmd` on a click; the value is shown dim on the right.
     Item(String, String, Cmd),
+    Action(String, String, Vec<Cmd>),
     /// One of the four slots of the display-arrangement picture; every slot draws its own quarter of it.
     Arrange(u8),
     /// A network adapter; a click shows or hides its details (the Info rows after it) when `bool` is set.
@@ -102,6 +103,7 @@ enum Cmd {
     EmptyBin,
     Uninstall(String),
     BtPair(String),
+    BtToggle(String, bool),
     BtUnpair(String),
     BtScan,
     Check,
@@ -184,6 +186,31 @@ fn row_at(y: i32, top: i32, h: i32, n: usize) -> Option<usize> {
     }
     let i = ((y - top) / h) as usize;
     (i < n).then_some(i)
+}
+
+fn action_button_rect(r: RECT, i: usize, n: usize, dpi: i32) -> RECT {
+    if n == 0 {
+        return RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    }
+    let p = |v: i32| v * dpi / 96;
+    let (gap, w) = (p(8), p(36));
+    let h = w.min(r.bottom - r.top - p(8)).max(p(1));
+    let right = r.right - p(16) - i as i32 * (w + gap);
+    let top = r.top + (r.bottom - r.top - h) / 2;
+    RECT { left: right - w, top, right, bottom: top + h }
+}
+
+fn in_rect(x: i32, y: i32, r: RECT) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+fn action_icon(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::BtToggle(_, connected) => if *connected { "\u{E711}" } else { "\u{E702}" },
+        Cmd::BtPair(_) => "\u{E710}",
+        Cmd::BtUnpair(_) | Cmd::Uninstall(_) => "\u{E74D}",
+        _ => "\u{E76C}",
+    }
 }
 
 fn os_name(product: &str, build: u32) -> String {
@@ -592,12 +619,16 @@ fn bt_rows() -> Vec<Row> {
         }
         for d in &s.paired {
             let st = if d.connected { t!("Подключено", "Connected") } else { t!("Сопряжено", "Paired") };
-            rows.push(Row::Item(d.name.clone(), st.into(), Cmd::BtUnpair(d.id.clone())));
+            rows.push(Row::Action(
+                d.name.clone(),
+                st.into(),
+                vec![Cmd::BtToggle(d.id.clone(), d.connected), Cmd::BtUnpair(d.id.clone())],
+            ));
         }
         rows.push(head(t!("Устройства поблизости", "Nearby devices")));
         rows.push(Row::Item(t!("Найти устройства", "Find devices").into(), if s.scanning { t!("поиск…", "searching…").into() } else { String::new() }, Cmd::BtScan));
         for d in s.nearby.iter().filter(|d| !s.paired.iter().any(|p| p.id == d.id)) {
-            rows.push(Row::Item(d.name.clone(), t!("Сопрячь", "Pair").into(), Cmd::BtPair(d.id.clone())));
+            rows.push(Row::Action(d.name.clone(), String::new(), vec![Cmd::BtPair(d.id.clone())]));
         }
     }
     rows
@@ -605,7 +636,14 @@ fn bt_rows() -> Vec<Row> {
 
 fn apps_rows(list: &[ext::App]) -> Vec<Row> {
     let mut rows = vec![Row::Header(tf!("Установленные программы: {}", "Installed programs: {}", list.len()))];
-    rows.extend(list.iter().take(400).map(|a| Row::Item(a.name.clone(), a.version.clone(), Cmd::Uninstall(a.uninstall.clone()))));
+    rows.extend(list.iter().take(400).map(|a| {
+        let buttons = if a.uninstall.trim().is_empty() {
+            vec![]
+        } else {
+            vec![Cmd::Uninstall(a.uninstall.clone())]
+        };
+        Row::Action(a.name.clone(), a.version.clone(), buttons)
+    }));
     rows
 }
 
@@ -1058,6 +1096,22 @@ unsafe fn paint(hwnd: HWND) {
                         text(mem, body, &value, RECT { left: inner.left + lw + p(16), right: inner.right - p(22), ..inner }, ink, DT_RIGHT);
                         text(mem, icon_s, "\u{E76C}", inner, t.dim, DT_RIGHT);
                     }
+                    Row::Action(label, value, buttons) => {
+                        let armed = a.armed.as_deref() == Some(label.as_str());
+                        let first = action_button_rect(r, 0, buttons.len(), a.dpi);
+                        let value_right = if buttons.is_empty() { inner.right } else { first.left - p(12) };
+                        let lw = text_width(mem, body, label).min(((value_right - inner.left) * 3 / 5).max(0));
+                        text(mem, body, label, RECT { right: inner.left + lw, ..inner }, if armed { winrust_common::style::BAD } else { t.fg }, DT_LEFT);
+                        text(mem, body, value, RECT { left: inner.left + lw + p(12), right: value_right, ..inner }, t.dim, DT_RIGHT);
+                        for (k, cmd) in buttons.iter().enumerate() {
+                            let br = action_button_rect(r, k, buttons.len(), a.dpi);
+                            let destructive = matches!(cmd, Cmd::Uninstall(_) | Cmd::BtUnpair(_));
+                            let hot = armed && destructive;
+                            shape(mem, br, if hot { mix(winrust_common::style::BAD, t.card, 0.25) } else { mix(t.card, t.fg, 0.08) }, rd(7));
+                            let ink = if hot { winrust_common::style::BAD } else if matches!(cmd, Cmd::BtToggle(_, false)) { t.accent } else { t.fg };
+                            text(mem, icon_s, action_icon(cmd), br, ink, DT_CENTER);
+                        }
+                    }
                     Row::Arrange(k) => {
                         // the whole picture is drawn in every slot, clipped to it: scrolling shows the right part of it
                         let top = r.top - p(ROW_H * *k as i32);
@@ -1185,7 +1239,7 @@ enum Act {
     Do(Op),
     Pick(Op, usize), // open the list of values of the row at this index
     Volume(f32, audio::Src),
-    Cmd(Cmd),
+    Cmd(Cmd, String),
     Arr(i32, i32),
     Wifi(wifi::Net),
     Adapter(String),
@@ -1207,15 +1261,25 @@ fn click(x: i32, y: i32, cw: i32) -> Option<Act> {
         if x < p(SIDE) {
             return row_at(y, p(NAV_TOP), p(NAV_H), a.pages.len()).map(Act::Page);
         }
+        let i = row_at_scrolled(a, y)?;
         let rows = &a.pages.get(a.page)?.rows;
-        match rows.get(row_at_scrolled(a, y)?)? {
+        match rows.get(i)? {
             Row::Cycle(_, _, op) if listed(*op) => Some(Act::Pick(*op, row_at_scrolled(a, y)?)),
             Row::Cycle(_, _, op) => Some(Act::Do(*op)),
             Row::Slider(_, src) => {
                 let (l, r) = track(cw, a.dpi);
                 (x >= l - p(12) && x <= r + p(12)).then(|| Act::Volume(slider_value(x, l, r), *src))
             }
-            Row::Item(_, _, cmd) => Some(Act::Cmd(cmd.clone())),
+            Row::Item(label, _, cmd) => Some(Act::Cmd(cmd.clone(), label.clone())),
+            Row::Action(label, _, buttons) => {
+                let (cl, cr) = col(cw, a.dpi);
+                let top = p(ROWS_TOP + ROW_H * i as i32 - a.scroll);
+                let r = RECT { left: cl, top, right: cr, bottom: top + p(ROW_H) };
+                (0..buttons.len())
+                    .find(|&k| in_rect(x, y, action_button_rect(r, k, buttons.len(), a.dpi)))
+                    .and_then(|k| buttons.get(k))
+                    .map(|cmd| Act::Cmd(cmd.clone(), label.clone()))
+            }
             Row::Arrange(_) => Some(Act::Arr(x, y)),
             Row::Toggle { key, name, on_when, default, .. } => {
                 let on = is_on(sys::dword(HKEY_CURRENT_USER, key, name), *on_when, *default);
@@ -1383,6 +1447,10 @@ unsafe fn run_cmd(hwnd: HWND, label: &str, cmd: Cmd) {
                         if ext::empty_bin(hwnd) {
                             say(t!("Корзина очищена", "Recycle Bin emptied").into());
                         }
+                    }
+                    Cmd::BtToggle(id, connected) => {
+                        say(if connected { t!("Отключение…", "Disconnecting…") } else { t!("Подключение…", "Connecting…") }.into());
+                        bt::connect(id, connected, ping);
                     }
                     Cmd::BtPair(id) => {
                         say(t!("Сопряжение…", "Pairing…").into());
@@ -1885,13 +1953,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         SetCapture(hwnd);
                         APP.with_borrow_mut(|a| a.drag = Some(src));
                     }
-                    Some(Act::Cmd(cmd)) => {
-                        let label = APP.with_borrow(|a| row_at_scrolled(a, (lp >> 16) as i16 as i32).and_then(|i| match a.pages.get(a.page)?.rows.get(i)? {
-                            Row::Item(l, ..) => Some(l.clone()),
-                            _ => None,
-                        }));
-                        run_cmd(hwnd, &label.unwrap_or_default(), cmd);
-                    }
+                    Some(Act::Cmd(cmd, label)) => run_cmd(hwnd, &label, cmd),
                     Some(Act::Arr(x, y)) => {
                         let started = APP.with_borrow_mut(|a| {
                             let bx = arr_box(a, rc.right)?;
@@ -2078,5 +2140,41 @@ mod tests {
         assert_eq!((page_for("ms-settings:sound"), page_for("ms-settings:personalization-colors")), (1, 7));
         assert_eq!((page_for("bluetooth"), page_for("apps"), page_for("update"), page_for("network")), (BT_PAGE, APPS_PAGE, WU_PAGE, NET_PAGE));
         assert_eq!((page_for("ms-settings:powersleep"), page_for("ms-settings:storagesense")), (2, 2));
+    }
+
+    #[test]
+    fn action_rows_only_react_to_their_buttons() {
+        APP.with_borrow_mut(|a| {
+            a.dpi = 96;
+            a.page = 0;
+            a.pages = vec![Page {
+                title: "Bluetooth".into(),
+                rows: vec![Row::Action(
+                    "Устройство".into(),
+                    "Сопряжено".into(),
+                    vec![Cmd::BtToggle("id".into(), false), Cmd::BtUnpair("id".into())],
+                )],
+            }];
+        });
+        let (cl, cr) = col(1000, 96);
+        let rr = RECT { left: cl, top: ROWS_TOP, right: cr, bottom: ROWS_TOP + ROW_H };
+        let y = ROWS_TOP + ROW_H / 2;
+        let first = action_button_rect(rr, 0, 2, 96);
+        let second = action_button_rect(rr, 1, 2, 96);
+        assert!(click(cl + 10, y, 1000).is_none());
+        match click((first.left + first.right) / 2, y, 1000) {
+            Some(Act::Cmd(Cmd::BtToggle(id, false), label)) => {
+                assert_eq!(id, "id");
+                assert_eq!(label, "Устройство");
+            }
+            _ => panic!("unexpected action"),
+        }
+        match click((second.left + second.right) / 2, y, 1000) {
+            Some(Act::Cmd(Cmd::BtUnpair(id), label)) => {
+                assert_eq!(id, "id");
+                assert_eq!(label, "Устройство");
+            }
+            _ => panic!("unexpected action"),
+        }
     }
 }

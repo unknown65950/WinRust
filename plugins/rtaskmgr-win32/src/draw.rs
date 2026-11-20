@@ -7,6 +7,8 @@ pub const ROW_H: f64 = 28.0;
 pub const NAV_W: f64 = 48.0;
 pub const NAV_W_OPEN: f64 = 220.0;
 pub const BAND_H: f64 = 52.0;
+pub const MINI_BAND_H: f64 = 54.0;
+pub const MINI_NAV_H: f64 = 40.0;
 
 pub fn series_color(i: usize, dark: bool) -> Rgb {
     let c = [Rgb(10, 132, 255), Rgb(94, 92, 230), Rgb(48, 209, 88), Rgb(255, 159, 10), Rgb(191, 90, 242)][i.min(4)]; // Apple system blue, indigo, green, orange, purple
@@ -53,6 +55,18 @@ impl App {
     // ---------------- боковая панель ----------------
     pub fn draw_nav(&self, g: &G, ui: &Ui, lay: &Lay) {
         let th = g.th;
+        if ui.mini {
+            g.fill(lay.nav, th.nav);
+            g.hline(lay.nav.l, lay.nav.r, lay.nav.t, th.border);
+            for (i, r) in lay.nav_items.iter().enumerate() {
+                let (page, icon, _) = NAV[i];
+                let sel = page == ui.page;
+                let hov = ui.hit == Hit::Nav(i);
+                if sel || hov { g.round(r.inset(g.px(2.0)), g.px(4.0), Some(if sel { th.sel } else { th.hover }), None); }
+                g.glyph(*r, icon, if sel { th.accent } else { th.text }, false);
+            }
+            return;
+        }
         g.fill(lay.nav, th.nav);
         g.glyph(lay.nav_toggle, '\u{E700}', th.text, false);
         if ui.hit == Hit::NavToggle {
@@ -81,6 +95,23 @@ impl App {
     pub fn draw_band(&self, g: &G, ui: &Ui, d: &Data, lay: &Lay) {
         let th = g.th;
         g.fill(lay.band, th.bg);
+        if ui.mini {
+            for (r, btn, label, glyph) in &lay.buttons {
+                let enabled = self.btn_enabled(ui, d, *btn);
+                let hov = enabled && ui.hit == Hit::Button(*btn);
+                if hov { g.round(*r, g.px(4.0), Some(th.hover), None); }
+                let c = if enabled { th.text } else { th.dim.lerp(th.bg, 0.35) };
+                let top = R::new(r.l, r.t + g.px(2.0), r.r, r.t + g.px(25.0));
+                let bot = R::new(r.l, r.t + g.px(25.0), r.r, r.b - g.px(1.0));
+                g.glyph(top, *glyph, if enabled && *btn == Btn::Efficiency { Rgb(48, 209, 88) } else { c }, true);
+                if !label.is_empty() { g.text_center(bot, label, Font::Small, c); }
+            }
+            if ui.search_open {
+                g.round(lay.search, g.px(5.0), Some(th.panel), Some(th.accent.lerp(th.panel, 0.5)));
+            }
+            g.hline(lay.band.l, lay.band.r, lay.band.b - 1, th.border);
+            return;
+        }
         g.text(lay.title, page_title(ui.page), Font::Title, th.text);
         if ui.page_has_search() {
             g.round(lay.search, g.px(5.0), Some(th.panel), Some(th.border));
@@ -131,20 +162,21 @@ impl App {
                 }
             }
             let inner = cell.inset(g.px(8.0));
+            let big = page == Page::Processes && !ui.mini;
             if let Some(m) = c.metric {
                 let val = agg_text(d, m);
-                if page == Page::Processes {
+                if big {
                     let top = R::new(inner.l, cell.t + g.px(8.0), inner.r, cell.t + g.px(32.0));
                     g.text_right(top, &val, Font::Big, th.text);
                     g.text_right(R::new(inner.l, cell.t + g.px(32.0), inner.r, cell.b - g.px(4.0)), c.title, Font::Small, th.dim);
                 } else {
-                    g.text_right(inner, c.title, Font::Semibold, th.text);
+                    g.text_right(inner, c.title, Font::Small, th.dim);
                 }
             } else if c.align == Align::Right {
-                g.text_right(R::new(inner.l, cell.t, inner.r, cell.b - if page == Page::Processes { g.px(4.0) } else { 0 }), c.title, if page == Page::Processes { Font::Small } else { Font::Semibold }, if page == Page::Processes { th.dim } else { th.text });
+                g.text_right(R::new(inner.l, cell.t, inner.r, cell.b - if big { g.px(4.0) } else { 0 }), c.title, if big { Font::Small } else { Font::Semibold }, if big { th.dim } else { th.text });
             } else {
-                let lr = R::new(inner.l + if i == 0 { g.px(12.0) } else { 0 }, if page == Page::Processes { cell.b - g.px(28.0) } else { cell.t }, inner.r, cell.b - if page == Page::Processes { g.px(2.0) } else { 0 });
-                g.text(lr, c.title, if page == Page::Processes { Font::Small } else { Font::Semibold }, if page == Page::Processes { th.dim } else { th.text });
+                let lr = R::new(inner.l + if i == 0 { g.px(12.0) } else { 0 }, if big { cell.b - g.px(28.0) } else { cell.t }, inner.r, cell.b - if big { g.px(2.0) } else { 0 });
+                g.text(lr, c.title, if big { Font::Small } else { Font::Semibold }, if big { th.dim } else { th.text });
             }
             if sort.0 == i {
                 let ch = if sort.1 { '\u{E70D}' } else { '\u{E70E}' }; // стрелка вниз/вверх

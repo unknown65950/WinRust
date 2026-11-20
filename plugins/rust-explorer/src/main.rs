@@ -2,7 +2,8 @@
 // Virtual list (LVS_OWNERDATA, only visible rows are asked for text/icon), system icons, tabs,
 // IFileOperation (recycle bin / undo / elevation prompts), real shell context menu with submenus, OLE drag and drop.
 // Keys: Enter open, Backspace up, F2 rename, Del recycle, Ctrl+C/X/V copy/cut/paste, Ctrl+N new folder,
-// Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service, right click / Menu key = shell context menu.
+// Ctrl+T/W/Tab tabs, Ctrl+M thumbnails, Ctrl+L/F4 address bar, Ctrl+F or "? terms" in the bar = instant search through the rs service,
+// Ctrl+Shift+F = cover-flow strip above the list (opens by itself in an image folder); right click / Menu key = shell context menu.
 // Look: topbar's palette, painted tabs / toolbar / address pill and status line (src/ui.rs), dark title bar and list.
 // Clipboard is the system one (Ctrl+C/X/V interoperate with Explorer). Also: Alt+Left/Right back/forward, Alt+Up up,
 // Alt+Enter properties, F5 refresh, Ctrl+H hidden files, click a column header to sort, right click on empty space = folder menu.
@@ -17,11 +18,12 @@
 //   shortcuts: wallpaper is loaded once (changing it needs a restart), icon labels are always white, no background menu /
 //   drag-to-position / auto-arrange, items from the public desktop can't be renamed.
 #![windows_subsystem = "windows"]
-use std::{cell::RefCell, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
-use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{BLACK_BRUSH, GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL}, Shell::*, WindowsAndMessaging::*}};
+use std::{cell::RefCell, collections::HashMap, env, fs, os::windows::fs::MetadataExt, path::{Path, PathBuf}, ptr, sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed}};
+use windows_sys::Win32::{Foundation::*, Graphics::Gdi::{BLACK_BRUSH, GetStockObject, InvalidateRect}, System::LibraryLoader::GetModuleHandleW, UI::{Controls::*, Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT}, Shell::*, WindowsAndMessaging::*}};
 
 mod jobs; // our own copier, ZIP packer, ZIP/7z unpacker (background, progress in the status line)
 mod ui; // the look: palette, painted tabs / toolbar / address pill / status line, dark theme
+mod cover; // cover-flow strip above the list
 
 static DESKTOP: AtomicBool = AtomicBool::new(false);
 fn desk() -> bool { DESKTOP.load(Relaxed) }
@@ -49,7 +51,8 @@ static TX: std::sync::OnceLock<std::sync::mpsc::Sender<(u32, usize, PathBuf)>> =
 const WM_GO: u32 = WM_APP + 1; // address bar: Enter (wp 13) / Esc (wp 27)
 static EDIT_OLD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-struct Row { name: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32 } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
+#[derive(Clone)]
+struct Row { name: String, title: String, dir: bool, size: u64, time: u64, icon: i32, thumb: i32 } // time: FILETIME ticks; thumb: -2 not asked, -1 asked, >=0 image-list index
 
 /// Back / forward trail of visited folders (one for the whole window, not per tab).
 #[derive(Default)]
@@ -68,16 +71,78 @@ impl Hist {
 struct State { list: HWND, tab: HWND, edit: HWND, dir: PathBuf, rows: Vec<Row>, thumbs: bool, himl: isize, tabs: Vec<PathBuf>, active: usize, hist: Hist }
 thread_local! {
     static ST: RefCell<State> = RefCell::new(State { list: 0 as _, tab: 0 as _, edit: 0 as _, dir: PathBuf::new(), rows: vec![], thumbs: false, himl: 0, tabs: vec![], active: 0, hist: Hist { v: vec![], pos: 0 } });
+    static WATCH: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; // last seen row names
+    static SHELL_TITLES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 static SORT_COL: AtomicUsize = AtomicUsize::new(0); // 0 name, 1 size, 2 modified
 static SORT_ASC: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false); // Ctrl+H
 static NAV: AtomicBool = AtomicBool::new(false); // loading from the back / forward trail: do not record it again
+static BUSY: AtomicBool = AtomicBool::new(false); // a blocking shell drag is in progress
 const WM_NAV: u32 = WM_APP + 3; // wp: 1 back, 2 forward, 3 properties, 4 up (sent from the message loop for Alt+key)
 const WM_JOB: u32 = WM_APP + 5; // jobs.rs worker finished: wp = Box<Option<String>> (the error, if any)
+const WM_COVER: u32 = WM_APP + 6; // worker -> UI: wp = Box<(era, cover index, HBITMAP)>
+const WM_DEVICE_CHANGE: u32 = 0x0219;
+const DBT_DEVICEARRIVAL: u32 = 0x8000;
+const DBT_DEVICEREMOVECOMPLETE: u32 = 0x8004;
+const DBT_DEVTYP_VOLUME: u32 = 0x0002;
+const DBT_DEVTYP_DEVICEINTERFACE: u32 = 0x0005;
+const DBTF_NET: u16 = 0x0002;
+
+#[repr(C)]
+struct DevBroadcastHdr { dbch_size: u32, dbch_devicetype: u32, dbch_reserved: u32 }
+
+#[repr(C)]
+struct DevBroadcastVolume { dbcv_size: u32, dbcv_devicetype: u32, dbcv_reserved: u32, dbcv_unitmask: u32, dbcv_flags: u16 }
+
+fn volume_mask(m: u32, wp: WPARAM, lp: LPARAM) -> Option<u32> {
+    if m != WM_DEVICE_CHANGE || !matches!(wp as u32, DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) { return None; }
+    unsafe {
+        let hdr = lp as *const DevBroadcastHdr;
+        if hdr.is_null() || (*hdr).dbch_size < size_of::<DevBroadcastVolume>() as u32 || (*hdr).dbch_devicetype != DBT_DEVTYP_VOLUME { return None; }
+        let v = &*(hdr as *const DevBroadcastVolume);
+        if v.dbcv_flags & DBTF_NET != 0 || v.dbcv_unitmask == 0 { return None; }
+        Some(v.dbcv_unitmask)
+    }
+}
+
+fn device_interface_changed(m: u32, wp: WPARAM, lp: LPARAM) -> bool {
+    if m != WM_DEVICE_CHANGE || !matches!(wp as u32, DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) { return false; }
+    unsafe {
+        let hdr = lp as *const DevBroadcastHdr;
+        !hdr.is_null() && (*hdr).dbch_devicetype == DBT_DEVTYP_DEVICEINTERFACE
+    }
+}
+
+fn path_on_mask(p: &Path, mask: u32) -> bool {
+    let s = p.to_string_lossy().to_lowercase();
+    (0..26u32).any(|i| mask & (1 << i) != 0 && s.starts_with(&format!("{}:\\", (b'a' + i as u8) as char)))
+}
 
 fn row(name: String, m: Option<&fs::Metadata>) -> Row {
-    Row { name, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2 }
+    let title = name.clone();
+    Row { name, title, dir: m.is_some_and(|m| m.is_dir()), size: m.map_or(0, |m| m.len()), time: m.map_or(0, |m| m.last_write_time()), icon: -1, thumb: -2 }
+}
+
+fn shell_key(p: &Path) -> String { p.to_string_lossy().into_owned() }
+
+fn remember_shell_title(p: &PathBuf, title: &str) {
+    SHELL_TITLES.with_borrow_mut(|m| { m.insert(shell_key(p), title.to_string()); });
+}
+
+fn shell_title(p: &PathBuf) -> String {
+    SHELL_TITLES.with_borrow(|m| m.get(&shell_key(p)).cloned()).unwrap_or_else(|| p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()))
+}
+
+fn shell_devices() -> Vec<(String, PathBuf, bool)> { sh::devices() }
+
+fn row_path(dir: &Path, name: &str) -> PathBuf {
+    let p = Path::new(name);
+    if p.is_absolute() || sh::is_shell(p) { p.to_path_buf() } else { dir.join(p) }
+}
+
+fn up_from(dir: &Path) -> Option<PathBuf> {
+    if sh::is_shell(dir) { sh::parent(dir) } else { dir.parent().map(Path::to_path_buf) }
 }
 
 /// Folders always first; inside each group by the column (0 name, 1 size, 2 modified), ties by name.
@@ -125,6 +190,7 @@ fn is_pic(p: &std::path::Path) -> bool {
 }
 
 fn properties(path: &PathBuf) {
+    if sh::is_shell(path) { let _ = sh::properties(path); return; }
     let (f, v) = (w(&path.to_string_lossy()), w("properties"));
     let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -136,6 +202,12 @@ fn properties(path: &PathBuf) {
 /// New folder / new empty file with a free name ("New folder", "New folder (2)", ...).
 fn new_entry(dir: &PathBuf, base: &str, folder: bool) {
     let (stem, ext) = match base.rsplit_once('.') { Some((s, e)) if !folder => (s.to_string(), format!(".{e}")), _ => (base.to_string(), String::new()) };
+    if sh::is_shell(dir) {
+        let used = rows_of(dir).map(|v| v.into_iter().map(|r| r.title).collect::<Vec<_>>()).unwrap_or_default();
+        let name = (1..).map(|n| if n == 1 { base.to_string() } else { format!("{stem} ({n}){ext}") }).find(|n| !used.iter().any(|u| u.eq_ignore_ascii_case(n))).unwrap_or_else(|| base.to_string());
+        let _ = sh::new_item(dir, &name, folder);
+        return;
+    }
     let path = (1..).map(|n| dir.join(if n == 1 { base.to_string() } else { format!("{stem} ({n}){ext}") })).find(|p| !p.exists());
     if let Some(p) = path { let _ = if folder { fs::create_dir(p) } else { fs::File::create(p).map(drop) }; }
 }
@@ -145,7 +217,8 @@ fn new_entry(dir: &PathBuf, base: &str, folder: bool) {
 /// same drive (a rename), shell items, and folders that need elevation go through the shell.
 fn paste(h: HWND, dir: &PathBuf) {
     let Some((paths, cut)) = sh::clip_get() else { return };
-    let fast = jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
+    let shell = sh::is_shell(dir) || paths.iter().any(|p| sh::is_shell(p));
+    let fast = !shell && jobs::can_fast_copy(&paths, dir) && !(cut && paths.iter().all(|p| jobs::same_volume(p, dir))) && jobs::writable(dir);
     if fast && !jobs::busy() {
         jobs::copy(h as isize, paths, dir.clone(), cut);
     } else {
@@ -160,16 +233,23 @@ const MENU_PIN: u32 = 0x9003;
 
 /// The shell menu for the selection, with our "Compress to ZIP" / "Extract here" on top.
 fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
-    let mut extra = vec![(MENU_ZIP, "Compress to ZIP")];
-    if paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
+    let shell = sh::is_shell(dir) || paths.iter().any(|p| sh::is_shell(p));
+    let mut extra = if shell { vec![] } else { vec![(MENU_ZIP, "Compress to ZIP")] };
+    if !shell && paths.iter().all(|p| p.is_file() && jobs::is_archive(p)) {
         extra.insert(0, (MENU_EXTRACT, "Extract here"));
     }
-    if let [p] = paths { if p.is_dir() { extra.push((MENU_PIN, if ui::pins().contains(p) { "Unpin from Quick access" } else { "Pin to Quick access" })); } }
+    if !shell {
+        if let [p] = paths {
+            if p.is_dir() {
+                extra.push((MENU_PIN, if ui::pins().contains(p) { "Unpin from Quick access" } else { "Pin to Quick access" }));
+            }
+        }
+    }
     let picked = sh::show(h, paths, if jobs::busy() { &[] } else { &extra }).ok().flatten();
     match picked {
         Some(MENU_PIN) => ui::toggle_pin(&paths[0]),
         Some(MENU_ZIP) => {
-            let base = if paths.len() == 1 { paths[0].file_stem().unwrap_or_default().to_string_lossy().into_owned() } else { dir.file_name().map_or("Archive".into(), |n| n.to_string_lossy().into_owned()) };
+            let base = if paths.len() == 1 { paths[0].file_stem().unwrap_or_default().to_string_lossy().into_owned() } else { label(&dir.to_path_buf()) };
             let dest = jobs::free_name(dir, &format!("{base}.zip"), false);
             jobs::zip(h as isize, paths.to_vec(), dest);
         }
@@ -181,15 +261,15 @@ fn item_menu(h: HWND, dir: &Path, paths: &[PathBuf]) {
 /// Right click on empty space: the folder's own menu.
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn bg_menu(h: HWND) {
+    let dir = cur_dir();
     let m = CreatePopupMenu();
     for (id, t) in [(1usize, "New folder"), (2, "New text file"), (3, "Paste"), (4, "Refresh"), (5, "Properties")] { AppendMenuW(m, MF_STRING, id, w(t).as_ptr()); }
-    let disk = tool("wiztree");
+    let disk = tool("wiztree").filter(|_| !sh::is_shell(&dir));
     if disk.is_some() { AppendMenuW(m, MF_STRING, 6, w("Disk usage (WinRust Disk)").as_ptr()); }
     let mut pt: POINT = std::mem::zeroed();
     GetCursorPos(&mut pt);
     let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, ptr::null());
     DestroyMenu(m);
-    let dir = cur_dir();
     match id {
         6 => { // wiztree takes the drive letter and asks for admin rights itself
             let drive: String = dir.to_string_lossy().chars().take(2).collect();
@@ -218,6 +298,15 @@ fn w(s: &str) -> Vec<u16> { s.encode_utf16().chain([0]).collect() }
 
 fn put(h: HWND, msg: u32, wp: usize, lp: isize) -> isize { unsafe { SendMessageW(h, msg, wp, lp) } }
 
+/// F2 on an item: start the list's label edit in place (no reload) and select the name, not the extension, like Explorer.
+fn label_edit(list: HWND, i: i32, name: &str) {
+    if i < 0 { return; }
+    let edit = put(list, LVM_EDITLABELW, i as usize, 0) as HWND;
+    if edit.is_null() { return; }
+    let n = name.rfind('.').filter(|&d| d > 0 && d as usize + 1 < name.len()).map(|d| d as isize).unwrap_or(-1);
+    put(edit, EM_SETSEL, 0, n);
+}
+
 fn wstr(p: *const u16) -> String {
     let mut n = 0;
     while unsafe { *p.add(n) } != 0 { n += 1; }
@@ -228,6 +317,7 @@ pub fn cur_dir() -> PathBuf { ST.with_borrow(|st| st.dir.clone()) }
 
 /// System image-list index. Extension-based (no disk access) except for files that carry their own icon.
 fn icon_of(p: &PathBuf, dir: bool) -> i32 {
+    if sh::is_shell(p) { return sh::icon_of_shell(p); }
     let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     let own = !dir && matches!(ext.as_str(), "exe" | "lnk" | "ico" | "url" | "scr");
     let mut fi: SHFILEINFOW = unsafe { std::mem::zeroed() };
@@ -252,12 +342,21 @@ fn shown_name(name: &str, desktop: bool) -> String {
 }
 
 fn label(dir: &PathBuf) -> String {
-    dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
+    if sh::is_shell(dir) { shell_title(dir) } else { dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()) }
 }
 
 /// Rows of `dir`, folders first. Desktop mode merges the public desktop (absolute names) and hides hidden files.
 /// None = `dir` itself is unreadable.
 fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
+    if sh::is_shell(dir) {
+        return sh::children(dir).map(|v| v.into_iter().map(|(title, path, folder)| {
+            remember_shell_title(&path, &title);
+            let mut r = row(path.to_string_lossy().into_owned(), None);
+            r.title = title;
+            r.dir = folder;
+            r
+        }).collect());
+    }
     let mut dirs = vec![dir.clone()];
     if desk() { dirs.extend(sh::desktop_dirs().into_iter().skip(1)); }
     let mut rows = vec![];
@@ -274,10 +373,16 @@ fn rows_of(dir: &PathBuf) -> Option<Vec<Row>> {
     Some(rows)
 }
 
+fn watch_signature(rows: &[Row]) -> Vec<String> { rows.iter().map(|r| r.name.clone()).collect() }
+
 /// Loads `dir` into the virtual list and the active tab. Unreadable dir (access denied, gone) leaves the view unchanged.
 /// Never call with ST borrowed: the list sends GETDISPINFO back into the window proc.
 fn load(h: HWND, dir: PathBuf) {
     let Some(rows) = rows_of(&dir) else { return };
+    let old_dir = ST.with_borrow(|st| st.dir.clone());
+    let changed = !desk() && old_dir != dir;
+    let pics = if changed && !sh::is_shell(&dir) { cover::from_rows(&dir, &rows, None, true) } else { None };
+    WATCH.with_borrow_mut(|w| *w = watch_signature(&rows));
     if !desk() { unsafe { SetWindowTextW(h, w(&dir.to_string_lossy()).as_ptr()) }; }
     let (list, tab, edit, active, n) = ST.with_borrow_mut(|st| {
         if let Some(t) = st.tabs.get_mut(st.active) { *t = dir.clone(); }
@@ -292,6 +397,10 @@ fn load(h: HWND, dir: PathBuf) {
     reset_thumbs();
     put(list, LVM_DELETEALLITEMS, 0, 0);
     if desk() { desk::fill(list, n); } else { put(list, LVM_SETITEMCOUNT, n, 0); }
+    if changed {
+        if let Some((paths, i)) = pics { unsafe { cover::open(h, paths, i) }; }
+        else if cover::is_open() { unsafe { cover::close() }; }
+    }
 }
 
 /// Asks the rust-search service of drive `d` (see plugins/rust-search): terms in, one path per line out.
@@ -381,6 +490,19 @@ fn reset_thumbs() {
 
 fn reload(h: HWND) { load(h, cur_dir()); }
 
+/// Polls the visible folder: a new / removed / renamed row triggers the same reload as F5.
+/// Skipped during a drag, an in-place rename and search results, where a reload would throw away what the user is doing.
+fn auto_reload(h: HWND) {
+    if BUSY.load(Relaxed) || ui::searching() || sh::is_shell(&cur_dir()) { return; }
+    let list = ST.with_borrow(|st| st.list);
+    if list.is_null() || put(list, LVM_GETEDITCONTROL, 0, 0) != 0 { return; }
+    let dir = cur_dir();
+    let Some(rows) = rows_of(&dir) else { return };
+    let names = watch_signature(&rows);
+    if WATCH.with_borrow(|w| w == &names) { return; }
+    load(h, dir);
+}
+
 /// (list, current dir, full paths of the selected rows)
 fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
     ST.with_borrow(|st| {
@@ -388,7 +510,7 @@ fn selected() -> (HWND, PathBuf, Vec<PathBuf>) {
         loop {
             i = put(st.list, LVM_GETNEXTITEM, i as usize, LVNI_SELECTED as isize);
             let Some(r) = usize::try_from(i).ok().and_then(|i| st.rows.get(i)) else { break };
-            sel.push(st.dir.join(&r.name));
+            sel.push(row_path(&st.dir, &r.name));
         }
         (st.list, st.dir.clone(), sel)
     })
@@ -487,8 +609,9 @@ mod wall {
 
 /// Shell integration through COM (windows crate): file operations, context menu, drag and drop.
 mod sh {
-    use std::{cell::RefCell, ffi::c_void, os::windows::ffi::OsStrExt, path::PathBuf};
-    use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::MODIFIERKEYS_FLAGS}, UI::{Shell::{Common::ITEMIDLIST, *}, WindowsAndMessaging::*}}};
+    use std::{cell::{Cell, RefCell}, ffi::c_void, os::windows::ffi::OsStrExt, path::{Path, PathBuf}};
+    use windows::{core::*, Win32::{Foundation::*, System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock}, Ole::*, SystemServices::{MODIFIERKEYS_FLAGS, SFGAO_FOLDER}}, UI::{Shell::{Common::ITEMIDLIST, *}, WindowsAndMessaging::*}}};
+    use windows_sys::Win32::{Foundation::POINT as SysPoint, Graphics::Gdi::ScreenToClient, UI::Controls::{LVHITTESTINFO, LVM_HITTEST}};
 
     #[derive(Clone, Copy)]
     pub enum Op { Copy, Move, Delete }
@@ -515,6 +638,113 @@ mod sh {
 
     pub fn init() { unsafe { let _ = OleInitialize(None); } }
 
+    pub const PORTABLE_DEVICES: &str = "shell:::{35786D3C-B075-49B9-88DD-029876E11C01}";
+    thread_local! { static DEVNOTIFY: Cell<isize> = const { Cell::new(0) }; }
+
+    pub fn is_shell(p: &Path) -> bool {
+        let s = p.to_string_lossy().to_lowercase();
+        s.starts_with("::{") || s.starts_with("shell:")
+    }
+
+    pub fn watch_devices(h: *mut c_void) {
+        unsafe {
+            let filter = DEV_BROADCAST_DEVICEINTERFACE_W {
+                dbcc_size: size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
+                dbcc_devicetype: DBT_DEVTYP_DEVICEINTERFACE.0,
+                dbcc_reserved: 0,
+                dbcc_classguid: GUID::from_u128(0x6ac27878_a6fa_4155_ba85_f98f491d4f33),
+                dbcc_name: [0],
+            };
+            if let Ok(hn) = RegisterDeviceNotificationW(HANDLE(h), &filter as *const _ as *const c_void, DEVICE_NOTIFY_WINDOW_HANDLE) {
+                DEVNOTIFY.set(hn.0 as isize);
+            }
+        }
+    }
+
+    pub fn unwatch_devices() {
+        let p = DEVNOTIFY.replace(0);
+        if p != 0 { unsafe { let _ = UnregisterDeviceNotification(HDEVNOTIFY(p as *mut c_void)); } }
+    }
+
+    fn name(it: &IShellItem, sigdn: SIGDN) -> Option<String> {
+        unsafe {
+            let p = it.GetDisplayName(sigdn).ok()?;
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const c_void));
+            Some(s)
+        }
+    }
+
+    pub fn children(dir: &Path) -> Option<Vec<(String, PathBuf, bool)>> {
+        unsafe {
+            let wide = wide(&dir.to_path_buf());
+            let folder: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+            let en = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems).ok()?;
+            let mut out = vec![];
+            loop {
+                let mut items = [None];
+                let mut got = 0u32;
+                if en.Next(&mut items, Some(&mut got)).is_err() || got == 0 { break; }
+                let Some(it) = items[0].take() else { break };
+                let (Some(title), Some(path)) = (name(&it, SIGDN_NORMALDISPLAY), name(&it, SIGDN_DESKTOPABSOLUTEPARSING)) else { continue };
+                if title.is_empty() || path.is_empty() { continue; }
+                let is_dir = it.GetAttributes(SFGAO_FOLDER).map(|a| a.0 & SFGAO_FOLDER.0 != 0).unwrap_or(false);
+                out.push((title, PathBuf::from(path), is_dir));
+            }
+            Some(out)
+        }
+    }
+
+    pub fn devices() -> Vec<(String, PathBuf, bool)> { children(Path::new(PORTABLE_DEVICES)).unwrap_or_default() }
+
+    pub fn parent(p: &Path) -> Option<PathBuf> {
+        unsafe {
+            let it: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide(&p.to_path_buf()).as_ptr()), None).ok()?;
+            let up = it.GetParent().ok()?;
+            name(&up, SIGDN_DESKTOPABSOLUTEPARSING).map(PathBuf::from)
+        }
+    }
+
+    fn invoke(p: &PathBuf, verb: PCWSTR) -> bool {
+        unsafe {
+            let mut pidl = std::ptr::null_mut();
+            if SHParseDisplayName(PCWSTR(wide(p).as_ptr()), None, &mut pidl, 0, None).is_err() { return false; }
+            let _owned = Pidls(vec![pidl]);
+            let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
+            sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+            sei.fMask = SEE_MASK_INVOKEIDLIST;
+            sei.lpVerb = verb;
+            sei.lpIDList = pidl as *mut c_void;
+            sei.nShow = SW_SHOW.0;
+            ShellExecuteExW(&mut sei).is_ok()
+        }
+    }
+
+    pub fn open(p: &PathBuf) -> bool { invoke(p, w!("open")) }
+
+    pub fn properties(p: &PathBuf) -> bool { invoke(p, w!("properties")) }
+
+    pub fn rename(p: &PathBuf, new: &str) -> Result<()> {
+        unsafe {
+            let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+            let it = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(p).as_ptr()), None)?;
+            let n: Vec<u16> = new.encode_utf16().chain([0]).collect();
+            fo.RenameItem(&it, PCWSTR(n.as_ptr()), None::<&IFileOperationProgressSink>)?;
+            fo.PerformOperations()
+        }
+    }
+
+    pub fn new_item(dir: &PathBuf, name: &str, folder: bool) -> Result<()> {
+        unsafe {
+            let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+            let dest = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide(dir).as_ptr()), None)?;
+            let n: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            let attr = if folder { 0x10 } else { 0x80 };
+            fo.NewItem(&dest, attr, PCWSTR(n.as_ptr()), PCWSTR::null(), None::<&IFileOperationProgressSink>)?;
+            fo.PerformOperations()
+        }
+    }
+
     fn wide(p: &PathBuf) -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() }
 
     /// Copy / move into `to`, or recycle. Must not be called while ST is borrowed (the shell pumps messages).
@@ -539,28 +769,37 @@ mod sh {
 
     /// Background thumbnail loader: GetImage for each (era, row, path) asked for, result posted to the main window.
     pub fn start_thumbs(main: isize) -> std::sync::mpsc::Sender<(u32, usize, PathBuf)> {
+        start_images(main, super::THUMB, super::WM_THUMB, false)
+    }
+
+    /// The same loader for the cover-flow strip: larger images, posted to cover::thumb().
+    pub fn start_cover_thumbs(main: isize) -> std::sync::mpsc::Sender<(u32, usize, PathBuf)> {
+        start_images(main, 320, super::WM_COVER, true)
+    }
+
+    fn start_images(main: isize, size: i32, msg: u32, cover: bool) -> std::sync::mpsc::Sender<(u32, usize, PathBuf)> {
         let (tx, rx) = std::sync::mpsc::channel::<(u32, usize, PathBuf)>();
         std::thread::spawn(move || unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             for (era, row, path) in rx {
-                if era != super::GEN.load(std::sync::atomic::Ordering::Relaxed) { continue; }
+                let stale = if cover { era != super::cover::generation() } else { era != super::GEN.load(std::sync::atomic::Ordering::Relaxed) };
+                if stale { continue; }
                 let Ok(f) = SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wide(&path).as_ptr()), None) else { continue };
-                let Ok(bmp) = f.GetImage(SIZE { cx: super::THUMB, cy: super::THUMB }, SIIGBF_BIGGERSIZEOK) else { continue };
-                let padded = pad(bmp.0);
+                let Ok(bmp) = f.GetImage(SIZE { cx: size, cy: size }, SIIGBF_BIGGERSIZEOK) else { continue };
+                let padded = pad_to(bmp.0, size);
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp.0 as _);
                 if padded.is_null() { continue; }
                 let b = Box::new((era, row, padded as isize));
-                let _ = PostMessageW(Some(HWND(main as *mut c_void)), super::WM_THUMB, WPARAM(Box::into_raw(b) as usize), LPARAM(0));
+                let _ = PostMessageW(Some(HWND(main as *mut c_void)), msg, WPARAM(Box::into_raw(b) as usize), LPARAM(0));
             }
         });
         tx
     }
 
-    /// Centers `src` (any size up to THUMB, 32-bit with alpha) on a transparent THUMB x THUMB bitmap: ImageList_Add needs exact sizes.
-    unsafe fn pad(src: *mut c_void) -> *mut c_void {
+    /// Centers `src` on a transparent `t` x `t` bitmap: ImageList_Add needs exact sizes.
+    unsafe fn pad_to(src: *mut c_void, t: i32) -> *mut c_void {
         use windows_sys::Win32::Graphics::Gdi::*;
         unsafe {
-            let t = super::THUMB;
             let mut bm: BITMAP = std::mem::zeroed();
             GetObjectW(src as _, size_of::<BITMAP>() as i32, &mut bm as *mut _ as _);
             let mut bi: BITMAPINFO = std::mem::zeroed();
@@ -613,6 +852,17 @@ mod sh {
 
     struct Pidls(Vec<*mut ITEMIDLIST>);
     impl Drop for Pidls { fn drop(&mut self) { for p in &self.0 { unsafe { CoTaskMemFree(Some(*p as *const c_void)) }; } } }
+
+    pub fn icon_of_shell(p: &PathBuf) -> i32 {
+        unsafe {
+            let mut pidl = std::ptr::null_mut();
+            if SHParseDisplayName(PCWSTR(wide(p).as_ptr()), None, &mut pidl, 0, None).is_err() { return 0; }
+            let _owned = Pidls(vec![pidl]);
+            let mut fi: SHFILEINFOW = std::mem::zeroed();
+            SHGetFileInfoW(PCWSTR(pidl as *const ITEMIDLIST as *const u16), windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut fi), size_of::<SHFILEINFOW>() as u32, SHGFI_PIDL | SHGFI_SYSICONINDEX | SHGFI_SMALLICON);
+            fi.iIcon
+        }
+    }
 
     /// A shell UI object (IContextMenu, IDataObject...) for items that all live in one folder.
     fn ui<T: Interface>(h: HWND, paths: &[PathBuf]) -> Result<T> {
@@ -709,11 +959,40 @@ mod sh {
 
     fn effect(k: MODIFIERKEYS_FLAGS) -> DROPEFFECT { if k.0 & 8 != 0 { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } } // 8 = MK_CONTROL
 
+    pub fn folder_row(rows: &[super::Row], dir: &std::path::Path, i: isize) -> Option<(usize, PathBuf)> {
+        let i = usize::try_from(i).ok()?;
+        rows.get(i).filter(|r| r.dir).map(|r| (i, super::row_path(dir, &r.name)))
+    }
+
+    fn drop_target(_main: isize, pt: &POINTL) -> Option<(usize, PathBuf)> {
+        let list = super::ST.with_borrow(|s| s.list);
+        if list.is_null() { return None; }
+        let mut p = SysPoint { x: pt.x, y: pt.y };
+        unsafe { ScreenToClient(list, &mut p) };
+        let mut ht: LVHITTESTINFO = unsafe { std::mem::zeroed() };
+        ht.pt = p;
+        let i = super::put(list, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
+        super::ST.with_borrow(|s| folder_row(&s.rows, &s.dir, i))
+    }
+
+    fn drop_highlight(main: isize, pt: &POINTL) {
+        unsafe { super::ui::drop_row(drop_target(main, pt).map(|(i, _)| i as isize)) };
+    }
+
     impl IDropTarget_Impl for DropT_Impl {
-        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = effect(k) }; Ok(()) }
-        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> { unsafe { *e = effect(k) }; Ok(()) }
-        fn DragLeave(&self) -> Result<()> { Ok(()) }
+        fn DragEnter(&self, _o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            drop_highlight(self.main, pt);
+            unsafe { *e = effect(k) };
+            Ok(())
+        }
+        fn DragOver(&self, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            drop_highlight(self.main, pt);
+            unsafe { *e = effect(k) };
+            Ok(())
+        }
+        fn DragLeave(&self) -> Result<()> { unsafe { super::ui::drop_row(None) }; Ok(()) }
         fn Drop(&self, o: Ref<'_, IDataObject>, k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            unsafe { super::ui::drop_row(None) };
             if super::desk::dragging() {
                 // desktop icons dropped back on the desktop: a move of the icons, not of the files (the dragger finishes it)
                 super::desk::dropped_here((pt.x, pt.y));
@@ -721,7 +1000,12 @@ mod sh {
                 return Ok(());
             }
             let paths = hdrop_paths(o.ok()?)?;
-            let to = super::cur_dir();
+            let target = drop_target(self.main, pt);
+            if target.as_ref().is_some_and(|(_, p)| paths.contains(p)) {
+                unsafe { *e = DROPEFFECT_NONE };
+                return Ok(());
+            }
+            let to = target.map(|(_, p)| p).unwrap_or_else(super::cur_dir);
             // like Explorer: same drive moves, other drive copies, Ctrl forces copy
             let copy = k.0 & 8 != 0 || paths.first().and_then(|p| p.components().next()) != to.components().next();
             unsafe { *e = if copy { DROPEFFECT_COPY } else { DROPEFFECT_MOVE } };
@@ -734,6 +1018,38 @@ mod sh {
     pub fn register_drop(list: *mut c_void, main: isize) -> Result<()> {
         let t: IDropTarget = DropT { main }.into();
         unsafe { RegisterDragDrop(HWND(list), &t) }
+    }
+
+    #[implement(IDropTarget)]
+    struct NavDropT { main: isize }
+
+    impl IDropTarget_Impl for NavDropT_Impl {
+        fn DragEnter(&self, _o: Ref<'_, IDataObject>, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let ok = super::ui::nav_drop_at(pt.y);
+            if ok { super::ui::nav_drop_begin(); } else { super::ui::nav_drop_end(); }
+            unsafe { *e = if ok { DROPEFFECT_LINK } else { DROPEFFECT_NONE } };
+            Ok(())
+        }
+        fn DragOver(&self, _k: MODIFIERKEYS_FLAGS, pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            let ok = super::ui::nav_drop_at(pt.y);
+            if ok { super::ui::nav_drop_begin(); } else { super::ui::nav_drop_end(); }
+            unsafe { *e = if ok { DROPEFFECT_LINK } else { DROPEFFECT_NONE } };
+            Ok(())
+        }
+        fn DragLeave(&self) -> Result<()> { super::ui::nav_drop_end(); Ok(()) }
+        fn Drop(&self, o: Ref<'_, IDataObject>, _k: MODIFIERKEYS_FLAGS, _pt: &POINTL, e: *mut DROPEFFECT) -> Result<()> {
+            super::ui::nav_drop_end();
+            let paths = hdrop_paths(o.ok()?)?;
+            let n = super::ui::nav_add(&paths);
+            unsafe { *e = if n > 0 { DROPEFFECT_LINK } else { DROPEFFECT_NONE } };
+            unsafe { let _ = PostMessageW(Some(HWND(self.main as *mut c_void)), WM_APP, WPARAM(0), LPARAM(0)); }
+            Ok(())
+        }
+    }
+
+    pub fn register_nav_drop(nav: *mut c_void, main: isize) -> Result<()> {
+        let t: IDropTarget = NavDropT { main }.into();
+        unsafe { RegisterDragDrop(HWND(nav), &t) }
     }
 }
 
@@ -883,7 +1199,7 @@ mod desk {
         ht.pt = pt;
         let tgt = put(list, LVM_HITTEST, 0, &mut ht as *mut _ as isize);
         if tgt >= 0 && !sel.contains(&(tgt as usize)) {
-            let target = ST.with_borrow(|st| st.rows.get(tgt as usize).filter(|r| r.dir).map(|r| st.dir.join(&r.name)));
+            let target = ST.with_borrow(|st| st.rows.get(tgt as usize).filter(|r| r.dir).map(|r| row_path(&st.dir, &r.name)));
             if let Some(t) = target {
                 let _ = sh::fileop(h as _, sh::Op::Move, &paths, &t);
                 let _ = dir;
@@ -1019,10 +1335,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 // desktop mode has no tab bar / address bar: the null handles are harmless to every SendMessage below
                 let (mut tab, mut edit) = (0 as HWND, 0 as HWND);
                 if !desk() {
+                    sh::watch_devices(h);
                     ui::dark_title(h);
                     // the chrome (tabs, toolbar, address pill) is one painted window; the address box is a real edit inside its pill
                     tab = CreateWindowExW(0, w("RxChrome").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
-                    ui::nav_init(CreateWindowExW(0, w("RxNav").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, 0 as _, inst, ptr::null()));
+                    let nav = CreateWindowExW(0, w("RxNav").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, h, 0 as _, inst, ptr::null());
+                    ui::nav_init(nav);
+                    let _ = sh::register_nav_drop(nav as _, h as isize);
                     edit = CreateWindowExW(0, w("EDIT").as_ptr(), ptr::null(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32, 0, 0, 0, 0, tab, 0 as _, inst, ptr::null());
                     put(edit, WM_SETFONT, ui::font(14, 400, ui::ui_face()) as usize, 1);
                     EDIT_OLD.store(SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize), std::sync::atomic::Ordering::Relaxed);
@@ -1061,11 +1380,12 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     ui::style_list(list);
                 }
                 ST.with_borrow_mut(|st| { st.list = list; st.tab = tab; st.edit = edit; st.tabs = vec![PathBuf::new()]; });
-                if !desk() { ui::place_edit(tab); }
+                if !desk() { ui::place_edit(tab); cover::create(h, inst); }
                 let _ = sh::register_drop(list as _, h as isize);
                 // live wallpaper: the list is see-through (colour key), so over empty desktop OLE finds the wallpaper window under it,
                 // and walks up from there to the desktop window: it must accept the drop too
                 if desk() { let _ = sh::register_drop(h as _, h as isize); }
+                SetTimer(h, 8, 900, None); // watch the visible folder for new files
                 let start = if desk() { sh::desktop_dirs().into_iter().next().unwrap_or_default() } else { env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\")) };
                 load(h, start);
                 0
@@ -1087,6 +1407,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 if desk() {
                     MoveWindow(list, 0, desk_top(), cw, (ch - desk_top() - desk_bottom()).max(0), 1);
                 } else {
+                    cover::layout(cw, ch);
                     ui::layout_children(cw, ch);
                     InvalidateRect(h, ptr::null(), 0);
                 }
@@ -1100,7 +1421,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     3 => tab_new(),
                     4 => nav(h, true),
                     5 => nav(h, false),
-                    6 => { if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) } }
+                    6 => { if let Some(p) = up_from(&cur_dir()) { load(h, p) } }
                     7 => reload(h),
                     8 => toggle_view(h),
                     9 => search_focus(),
@@ -1124,7 +1445,13 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 let list = ST.with_borrow(|st| st.list);
                 match nm.code {
                     NM_CUSTOMDRAW if nm.hwndFrom == list && !desk() => return ui::list_draw(lp), // the rows are painted by hand
-                    LVN_ITEMCHANGED | LVN_ODSTATECHANGED => ui::status_dirty(h), // selection count in the status line
+                    LVN_ITEMCHANGED | LVN_ODSTATECHANGED => {
+                        ui::status_dirty(h); // selection count in the status line
+                        if cover::is_open() {
+                            let (_, _, sel) = selected();
+                            if let Some(p) = sel.first() { cover::select(p); }
+                        }
+                    }
                     LVN_GETDISPINFOW => {
                         let it = &mut (*(lp as *mut NMLVDISPINFOW)).item;
                         // a request that arrives while ST is borrowed is skipped; the list repaints later
@@ -1134,7 +1461,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let Some(i) = usize::try_from(it.iItem).ok() else { return };
                             let Some(r) = rows.get_mut(i) else { return };
                             if it.mask & LVIF_TEXT != 0 && it.cchTextMax > 0 {
-                                let s = match it.iSubItem { 0 => shown_name(&r.name, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) };
+                                let s = match it.iSubItem { 0 => shown_name(&r.title, desk()), 1 => date_text(r.time), 2 => type_text(&r.name, r.dir), _ if r.dir => String::new(), _ => size_text(r.size) };
                                 let u: Vec<u16> = s.encode_utf16().take(it.cchTextMax as usize - 1).collect();
                                 ptr::copy_nonoverlapping(u.as_ptr(), it.pszText, u.len());
                                 *it.pszText.add(u.len()) = 0;
@@ -1142,21 +1469,22 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             if it.mask & LVIF_IMAGE != 0 && *thumbs {
                                 if r.thumb == -2 {
                                     r.thumb = -1;
-                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, dir.join(&r.name))); }
+                                    if let Some(tx) = TX.get() { let _ = tx.send((GEN.load(std::sync::atomic::Ordering::Relaxed), i, row_path(dir, &r.name))); }
                                 }
                                 it.iImage = if r.thumb >= 0 { r.thumb } else { I_IMAGENONE };
                             } else if it.mask & LVIF_IMAGE != 0 {
-                                if r.icon < 0 { r.icon = icon_of(&dir.join(&r.name), r.dir); }
+                                if r.icon < 0 { r.icon = icon_of(&row_path(dir, &r.name), r.dir); }
                                 it.iImage = r.icon;
                             }
                         });
                     }
                     LVN_ITEMACTIVATE => {
                         let i = (*(lp as *const NMITEMACTIVATE)).iItem;
-                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).map(|r| (st.dir.join(&r.name), r.dir)));
+                        let hit = ST.with_borrow(|st| usize::try_from(i).ok().and_then(|i| st.rows.get(i)).map(|r| (row_path(&st.dir, &r.name), r.dir)));
                         if let Some((p, is_dir)) = hit {
                             if is_dir && desk() { let _ = std::process::Command::new(env::current_exe().unwrap_or_default()).arg(p).spawn(); }
                             else if is_dir { load(h, p) }
+                            else if sh::is_shell(&p) { let _ = sh::open(&p); }
                             else if let Some(exe) = tool("photoview").filter(|_| is_pic(&p)) { let _ = std::process::Command::new(exe).arg(&p).spawn(); }
                             else { ShellExecuteW(0 as _, ptr::null(), w(&p.to_string_lossy()).as_ptr(), ptr::null(), ptr::null(), SW_SHOWNORMAL); }
                         }
@@ -1183,7 +1511,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                         drag_log(&format!("BEGINDRAG desk={} selected={}", desk(), paths.len()));
                         if !paths.is_empty() {
                             if desk() { let p = (*(lp as *const NMLISTVIEW)).ptAction; desk::drag_start((p.x, p.y)); }
+                            BUSY.store(true, Relaxed);
                             let r = sh::drag(h, &paths);
+                            BUSY.store(false, Relaxed);
                             drag_log(&format!("drag finished: {r:?}"));
                             // dropped on the desktop itself: the icons were moved (or went into a folder icon), no reload needed
                             let handled = desk() && desk::drag_end(h, list);
@@ -1194,16 +1524,26 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     LVN_KEYDOWN => {
                         let vk = (*(lp as *const NMLVKEYDOWN)).wVKey as u32;
                         let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
+                        let shift = GetKeyState(VK_SHIFT as i32) < 0;
                         if desk() && matches!(vk, 0x08 | 0x46 | 0x4D | 0x54 | 0x57 | 0x09 | 0x4C | 0x73) { return 0; } // browsing keys make no sense on the desktop
                         let (list, dir, paths) = selected();
                         match vk {
-                            0x08 => if let Some(p) = dir.parent() { load(h, p.to_path_buf()) },
+                            0x08 => if let Some(p) = up_from(&dir) { load(h, p) },
                             0x2E if !paths.is_empty() => { let _ = sh::fileop(h, sh::Op::Delete, &paths, &dir); }
                             // Space on a picture: a quick look in photoview (pictures only: videos and text are not previewed yet)
                             0x20 if !desk() => if let (Some(p), Some(exe)) = (paths.first().filter(|p| is_pic(p)), tool("photoview")) { let _ = std::process::Command::new(exe).arg(p).spawn(); },
                             0x71 => {
+                                // F2: edit the label in place; reloading here would cancel the edit box
                                 let i = put(list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize);
-                                if i >= 0 { put(list, LVM_EDITLABELW, i as usize, 0); }
+                                let name = usize::try_from(i).ok().and_then(|i| ST.with_borrow(|st| st.rows.get(i).map(|r| r.title.clone()))).unwrap_or_default();
+                                label_edit(list, i as i32, &name);
+                                return 0;
+                            }
+                            0x46 if ctrl && shift => {
+                                let (_, dir, sel) = selected();
+                                let rows = ST.with_borrow(|st| st.rows.clone());
+                                 if let Some((paths, i)) = cover::from_rows(&dir, &rows, sel.first(), false) { cover::open(h, paths, i); }
+                                return 0;
                             }
                             0x46 if ctrl => { search_focus(); return 0; } // Ctrl+F: address bar in search mode
                             0x73 | 0x4C if vk == 0x73 || ctrl => { // F4 / Ctrl+L: address bar
@@ -1243,7 +1583,10 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                             let new = wstr(it.pszText);
                             // reject separators so a rename can never move the item
                             if !new.is_empty() && !new.contains(['\\', '/', ':']) {
-                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) { let _ = fs::rename(st.dir.join(&r.name), st.dir.join(&new)); });
+                                ST.with_borrow(|st| if let Some(r) = usize::try_from(it.iItem).ok().and_then(|i| st.rows.get(i)) {
+                                    let p = row_path(&st.dir, &r.name);
+                                    if sh::is_shell(&p) { let _ = sh::rename(&p, &new); } else { let _ = fs::rename(p, st.dir.join(&new)); }
+                                });
                                 PostMessageW(h, WM_APP, 0, 0); // reload after the edit control is gone
                             }
                         }
@@ -1253,6 +1596,16 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             WM_SETFOCUS => { SetFocus(ST.with_borrow(|st| st.list)); 0 }
+            WM_DEVICE_CHANGE => {
+                if let Some(mask) = volume_mask(m, wp, lp) {
+                    if !desk() { ui::nav_refresh(); }
+                    if path_on_mask(&cur_dir(), mask) { reload(h); }
+                } else if device_interface_changed(m, wp, lp) && !desk() {
+                    ui::nav_refresh();
+                    if sh::is_shell(&cur_dir()) { reload(h); }
+                }
+                DefWindowProcW(h, m, wp, lp)
+            }
             WM_APP => { reload(h); 0 }
             WM_JOB => {
                 let err = *Box::from_raw(wp as *mut Option<String>);
@@ -1266,7 +1619,7 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     1 => nav(h, true),
                     2 => nav(h, false),
                     3 => { let (_, dir, sel) = selected(); properties(&sel.first().cloned().unwrap_or(dir)); }
-                    _ => if let Some(p) = cur_dir().parent() { load(h, p.to_path_buf()) },
+                    _ => if let Some(p) = up_from(&cur_dir()) { load(h, p) },
                 }
                 0
             }
@@ -1279,6 +1632,11 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                     if ok { put(list, LVM_REDRAWITEMS, row, row as isize); }
                 }
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(bmp as _);
+                0
+            }
+            WM_COVER => {
+                let (era, i, bmp) = *Box::from_raw(wp as *mut (u32, usize, isize));
+                cover::thumb(era, i, bmp);
                 0
             }
             WM_GO => {
@@ -1297,8 +1655,9 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
                 0
             }
             desk::SPAWN_WORKERW if desk() => { desk::spawn_workerw(h); 0 }
+            WM_TIMER if wp == 8 => { auto_reload(h); 0 }
             WM_TIMER if desk() && wp == 7 => { desk::check_live(ST.with_borrow(|st| st.list)); 0 }
-            WM_DESTROY => { PostQuitMessage(0); 0 }
+            WM_DESTROY => { sh::unwatch_devices(); PostQuitMessage(0); 0 }
             _ => DefWindowProcW(h, m, wp, lp),
         }
     }
@@ -1319,6 +1678,7 @@ fn main() {
         let bg = if desktop { GetStockObject(BLACK_BRUSH) as _ } else { windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(ui::pal().bg) };
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::proc), hInstance: inst, lpszClassName: w("RxChrome").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(ui::nav_proc), hInstance: inst, lpszClassName: w("RxNav").as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
+        RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(cover::proc), hInstance: inst, lpszClassName: w(cover::CLASS).as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), ..std::mem::zeroed() });
         RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(proc), hInstance: inst, lpszClassName: cls.as_ptr(), hCursor: LoadCursorW(0 as _, IDC_ARROW), hIcon: LoadIconW(inst, 1 as _), hbrBackground: bg, ..std::mem::zeroed() });
         if desktop {
             DESKTOP.store(true, Relaxed);
@@ -1352,7 +1712,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), dir, size, time, icon: -1, thumb: -2 } }
+    fn r(name: &str, dir: bool, size: u64, time: u64) -> Row { Row { name: name.into(), title: name.into(), dir, size, time, icon: -1, thumb: -2 } }
     fn names(v: &[Row]) -> Vec<&str> { v.iter().map(|r| r.name.as_str()).collect() }
 
     #[test]
@@ -1361,6 +1721,23 @@ mod tests {
         assert_eq!(shown_name("Notes.txt", true), "Notes.txt");
         assert_eq!(shown_name(r"C:\x\Game.URL", true), "Game");
         assert_eq!(shown_name(r"C:\x\Steam.lnk", false), r"C:\x\Steam.lnk");
+    }
+
+    #[test]
+    fn watch_signature_changes_when_a_file_appears() {
+        let a = [r("a.txt", false, 1, 1)];
+        let b = [r("a.txt", false, 1, 1), r("b.png", false, 2, 2)];
+        assert_ne!(watch_signature(&a), watch_signature(&b));
+        assert_eq!(watch_signature(&b), watch_signature(&b));
+    }
+
+    #[test]
+    fn drop_target_uses_only_folder_rows() {
+        let dir = PathBuf::from("C:\\base");
+        let rows = [r("a.txt", false, 1, 1), r("sub", true, 0, 2)];
+        assert_eq!(sh::folder_row(&rows, &dir, 1), Some((1, dir.join("sub"))));
+        assert_eq!(sh::folder_row(&rows, &dir, 0), None);
+        assert_eq!(sh::folder_row(&rows, &dir, -1), None);
     }
 
     #[test]
@@ -1414,6 +1791,71 @@ mod tests {
         assert_eq!(date_text(0), "");
         let t = date_text(132_000_000_000_000_000); // some day in 2019, local time zone
         assert!(t.len() == 16 && t.starts_with("20"), "{t}");
+    }
+
+    fn volume(devicetype: u32, unitmask: u32, flags: u16) -> DevBroadcastVolume {
+        DevBroadcastVolume { dbcv_size: size_of::<DevBroadcastVolume>() as u32, dbcv_devicetype: devicetype, dbcv_reserved: 0, dbcv_unitmask: unitmask, dbcv_flags: flags }
+    }
+
+    #[test]
+    fn volume_arrival_and_removal_are_detected() {
+        let v = volume(DBT_DEVTYP_VOLUME, 1 << 4, 0);
+        let lp = &v as *const _ as LPARAM;
+        assert_eq!(volume_mask(WM_DEVICE_CHANGE, DBT_DEVICEARRIVAL as WPARAM, lp), Some(1 << 4));
+        assert_eq!(volume_mask(WM_DEVICE_CHANGE, DBT_DEVICEREMOVECOMPLETE as WPARAM, lp), Some(1 << 4));
+        assert_eq!(volume_mask(WM_APP, DBT_DEVICEARRIVAL as WPARAM, lp), None);
+    }
+
+    #[test]
+    fn network_volumes_and_other_device_types_are_ignored() {
+        let net = volume(DBT_DEVTYP_VOLUME, 1 << 5, DBTF_NET);
+        assert_eq!(volume_mask(WM_DEVICE_CHANGE, DBT_DEVICEARRIVAL as WPARAM, &net as *const _ as LPARAM), None);
+        let other = volume(5, 1 << 5, 0);
+        assert_eq!(volume_mask(WM_DEVICE_CHANGE, DBT_DEVICEARRIVAL as WPARAM, &other as *const _ as LPARAM), None);
+    }
+
+    #[test]
+    fn path_on_changed_volume_matches_only_that_drive() {
+        let mask = 1 << 4;
+        assert!(path_on_mask(Path::new(r"E:\photos"), mask));
+        assert!(path_on_mask(Path::new(r"e:\"), mask));
+        assert!(!path_on_mask(Path::new(r"C:\photos"), mask));
+        assert!(!path_on_mask(Path::new(r"F:\photos"), mask));
+    }
+
+    #[test]
+    fn shell_paths_are_recognized_and_kept() {
+        let dev = PathBuf::from(r"::{35786D3C-B075-49B9-88DD-029876E11C01}\phone\storage");
+        assert!(sh::is_shell(&dev));
+        assert!(!sh::is_shell(Path::new(r"C:\photos")));
+        assert_eq!(row_path(Path::new(r"C:\photos"), dev.to_str().unwrap()), dev);
+        assert_eq!(row_path(Path::new(r"C:\photos"), "a.txt"), PathBuf::from(r"C:\photos\a.txt"));
+        assert_eq!(up_from(Path::new(r"C:\photos\sub")), Some(PathBuf::from(r"C:\photos")));
+    }
+
+    #[test]
+    fn device_interface_notifications_are_recognized() {
+        let hdr = DevBroadcastHdr { dbch_size: size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32, dbch_devicetype: DBT_DEVTYP_DEVICEINTERFACE, dbch_reserved: 0 };
+        let lp = &hdr as *const _ as LPARAM;
+        assert!(device_interface_changed(WM_DEVICE_CHANGE, DBT_DEVICEARRIVAL as WPARAM, lp));
+        assert!(device_interface_changed(WM_DEVICE_CHANGE, DBT_DEVICEREMOVECOMPLETE as WPARAM, lp));
+        assert!(!device_interface_changed(WM_APP, DBT_DEVICEARRIVAL as WPARAM, lp));
+        assert!(!device_interface_changed(WM_DEVICE_CHANGE, DBT_DEVICEARRIVAL as WPARAM, &volume(DBT_DEVTYP_VOLUME, 1, 0) as *const _ as LPARAM));
+    }
+
+    #[test]
+    #[ignore = "requires a connected MTP device"]
+    fn mtp_devices_are_enumerated() {
+        sh::init();
+        let root = sh::children(Path::new(sh::PORTABLE_DEVICES)).expect("cannot enumerate Portable Devices");
+        println!("root items={}", root.len());
+        let devices = sh::devices();
+        if devices.is_empty() { eprintln!("no portable devices present"); return; }
+        for (title, path, folder) in &devices { println!("{title}\t{path:?}\t{folder}"); }
+        let storage = devices.iter().find(|(_, p, folder)| *folder && sh::is_shell(p)).expect("no storage folder");
+        let children = sh::children(&storage.1).expect("cannot enumerate storage");
+        assert!(!children.is_empty(), "storage is empty");
+        for (title, path, folder) in children.iter().take(10) { println!("  {title}\t{path:?}\t{folder}"); }
     }
 }
 

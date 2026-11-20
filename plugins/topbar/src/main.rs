@@ -24,8 +24,8 @@ mod fly;
 mod quick;
 use windows::{
     Win32::{
-        Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
-        System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, IPersistFile, STGM},
+        Media::Audio::{Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender},
+        System::Com::{CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, STGM},
         UI::Shell::{IShellLinkW, ShellLink},
     },
     core::{Interface, PCWSTR},
@@ -135,6 +135,7 @@ static WIN_ALONE: AtomicBool = AtomicBool::new(false);
 static BAR: AtomicIsize = AtomicIsize::new(0); // the bar window, for the hook thread
 const VOLKEY: u32 = WM_APP + 14; // posted by the keyboard hook: a volume key (wp 0 up, 1 down, 2 mute)
 const SNIP: u32 = WM_APP + 13; // posted by the keyboard hook: PrtSc / Win+Shift+S with no explorer to handle them
+const WIN_APP: u32 = WM_APP + 15; // posted by the keyboard hook: Win+digit -> activate that taskbar app (wp 0..9)
 static EXPLORER_UP: AtomicBool = AtomicBool::new(true); // explorer's taskbar exists (it handles PrtSc itself then); refreshed by the bar
 
 struct Pin {
@@ -210,6 +211,7 @@ thread_local! {
     static SHOWN: RefCell<Option<Vec<String>>> = const { RefCell::new(None) }; // tray icons kept on the bar (by exe); None = none: every tray icon lives in the chevron flyout
     static TRAYFLY: Cell<HWND> = const { Cell::new(null_mut()) };
     static TF_ANIM: Cell<(u64, i32, i32)> = const { Cell::new((0, 0, 0)) }; // tray flyout: when it opened, its final x, y
+    static TF_HOLD: Cell<(bool, u64)> = const { Cell::new((false, 0)) }; // right click on an icon: the flyout waits for the app's menu to close
     static FHOT: Cell<i32> = const { Cell::new(-1) };
     static HOT: Cell<i32> = const { Cell::new(NONE) };
     static ORDER: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) }; // unpinned windows in the order their buttons were added
@@ -225,7 +227,7 @@ thread_local! {
     static WIFI: Cell<i32> = const { Cell::new(-1) }; // signal quality 0..100, -1 = not on wifi
     static INET: Cell<bool> = const { Cell::new(true) }; // Windows sees a way to the internet (any adapter)
     static TICK: Cell<u32> = const { Cell::new(0) };
-    static EP: RefCell<Option<IAudioEndpointVolume>> = const { RefCell::new(None) };
+    static AUDIO: RefCell<Option<(IMMDeviceEnumerator, String, IAudioEndpointVolume)>> = const { RefCell::new(None) };
     static TB_MSG: Cell<u32> = const { Cell::new(0) }; // "TaskbarCreated"
     static SH_MSG: Cell<u32> = const { Cell::new(0) }; // "SHELLHOOK": window events for the shell (we are the shell hook window without explorer)
     static EXP_TRAY: Cell<HWND> = const { Cell::new(null_mut()) }; // explorer's taskbar we registered with
@@ -407,13 +409,27 @@ fn fly_size() -> (usize, i32, i32) {
     (cols, sc(FCELL) * cols as i32 + sc(16), sc(FCELL) * n.div_ceil(cols) as i32 + sc(16) + sc(26))
 }
 
+/// Is a popup menu open on the foreground window's thread? An app's tray menu lives in another process, so look at its thread.
+unsafe fn menu_open() -> bool {
+    let fg = GetForegroundWindow();
+    if fg.is_null() {
+        return false;
+    }
+    let tid = GetWindowThreadProcessId(fg, null_mut());
+    let mut gi: GUITHREADINFO = zeroed();
+    gi.cbSize = size_of::<GUITHREADINFO>() as u32;
+    GetGUIThreadInfo(tid, &mut gi) != 0 && gi.flags & GUI_INMENUMODE != 0
+}
+
 unsafe fn fly_toggle() {
     let w = TRAYFLY.get();
     if IsWindowVisible(w) != 0 {
+        TF_HOLD.set((false, 0));
         ShowWindow(w, SW_HIDE);
         InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
         return;
     }
+    TF_HOLD.set((false, 0));
     let (_, fw, fh) = fly_size();
     FHOT.set(-1);
     let scr = GetSystemMetrics(SM_CXSCREEN);
@@ -510,20 +526,48 @@ unsafe extern "system" fn fly_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 if msg == WM_MBUTTONDOWN {
                     toggle_shown(&key);
                     InvalidateRect(hwnd, null(), 0);
+                } else if msg == WM_RBUTTONDOWN {
+                    // the app's context menu opens above: keep the flyout (and its icons) visible until it closes
+                    TF_HOLD.set((true, now_ms()));
+                    SetTimer(hwnd, 2, 60, None);
+                    tray_click(t, false);
                 } else {
                     ShowWindow(hwnd, SW_HIDE);
                     InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
-                    tray_click(t, msg == WM_LBUTTONDOWN);
+                    tray_click(t, true);
                 }
             }
             0
         }
         WM_ACTIVATE if wp & 0xffff == 0 => {
+            if TF_HOLD.get().0 {
+                return 0; // a tray icon's menu took the focus: the flyout stays behind it
+            }
             ShowWindow(hwnd, SW_HIDE);
             InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
             0
         }
         WM_TIMER => {
+            if wp == 2 {
+                let (hold, start) = TF_HOLD.get();
+                let fg = GetForegroundWindow();
+                if !hold {
+                    KillTimer(hwnd, 2);
+                } else if fg == hwnd {
+                    if now_ms().saturating_sub(start) > 400 {
+                        TF_HOLD.set((false, start)); // no menu appeared: keep the flyout as it is
+                        KillTimer(hwnd, 2);
+                    }
+                } else if menu_open() {
+                    // the app's menu is still up: wait for it
+                } else {
+                    TF_HOLD.set((false, start));
+                    KillTimer(hwnd, 2);
+                    ShowWindow(hwnd, SW_HIDE);
+                    InvalidateRect(BAR.load(Relaxed) as HWND, null(), 0); // the bar's chevron turns with it
+                }
+                return 0;
+            }
             let (_, x, y) = TF_ANIM.get();
             let e = tf_progress(0);
             SetLayeredWindowAttributes(hwnd, 0, (255.0 * e) as u8, LWA_ALPHA);
@@ -1083,23 +1127,34 @@ fn refresh_buttons() {
     BTNS.set(btns);
 }
 
+unsafe fn device_id(dev: &IMMDevice) -> Option<String> {
+    let id = dev.GetId().ok()?;
+    let s = id.to_string().ok();
+    CoTaskMemFree(Some(id.0 as *const std::ffi::c_void));
+    s
+}
+
 unsafe fn endpoint() -> Option<IAudioEndpointVolume> {
-    EP.with_borrow_mut(|e| {
-        if e.is_none() {
-            *e = (|| -> windows::core::Result<IAudioEndpointVolume> {
-                let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-                en.GetDefaultAudioEndpoint(eRender, eConsole)?.Activate(CLSCTX_ALL, None)
-            })()
-            .ok();
+    AUDIO.with_borrow_mut(|slot| {
+        let en: IMMDeviceEnumerator = match slot.as_ref() {
+            Some((en, _, _)) => en.clone(),
+            None => CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?,
+        };
+        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let id = device_id(&dev)?;
+        if let Some((_, cached, ep)) = slot.as_ref() {
+            if cached == &id { return Some(ep.clone()); }
         }
-        e.clone()
+        let ep: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
+        *slot = Some((en, id, ep.clone()));
+        Some(ep)
     })
 }
 
 unsafe fn read_volume() {
     let v = endpoint().and_then(|e| Some(((e.GetMasterVolumeLevelScalar().ok()? * 100.0).round() as i32, e.GetMute().ok()?.as_bool())));
     if v.is_none() {
-        EP.set(None); // device changed: look the endpoint up again next time
+        AUDIO.set(None); // device changed: look the endpoint up again next time
     }
     VOL.set(v.unwrap_or((-1, false)));
 }
@@ -1622,6 +1677,14 @@ unsafe extern "system" fn kb_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     PostMessageW(BAR.load(Relaxed) as HWND, SNIP, snip_key as usize, 0); // wp 1: PrtSc, 0: Win+Shift+S
                 }
                 return 1;
+            }
+            if let Some(n) = digit_index(k.vkCode) {
+                if down0 && (held(VK_LWIN) || held(VK_RWIN)) && GetAsyncKeyState(VK_MENU as i32) >= 0 && GetAsyncKeyState(VK_CONTROL as i32) >= 0 {
+                    WIN_ALONE.store(false, Relaxed);
+                    keys(&[0xE8]);
+                    PostMessageW(BAR.load(Relaxed) as HWND, WIN_APP, n, 0);
+                    return 1;
+                }
             }
             let down = w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize;
             let bar = BAR.load(Relaxed) as HWND;
@@ -2467,6 +2530,9 @@ unsafe fn open_launcher() -> bool {
     if h.is_null() {
         return false;
     }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(h, &mut pid);
+    AllowSetForegroundWindow(pid);
     PostMessageW(h, WM_HOTKEY, 1, (MOD_ALT | MOD_NOREPEAT) as isize | ((VK_SPACE as isize) << 16));
     true
 }
@@ -2567,6 +2633,29 @@ unsafe fn tile_windows() {
     TileWindows(null_mut(), MDITILE_VERTICAL, &wa, wins.len() as u32, wins.as_ptr());
 }
 
+fn digit_index(vk: u32) -> Option<usize> {
+    match vk { 0x30 => Some(9), 0x31..=0x39 => Some(vk as usize - 0x31), _ => None }
+}
+
+unsafe fn activate_btn(h: i32) {
+    let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
+    match wins.first() {
+        None => lnk.iter().for_each(|l| {
+            PINS.with_borrow_mut(|p| p.iter_mut().filter(|x| x.lnk == *l).for_each(|x| x.target = fix_msix_pin(l, &x.target).unwrap_or(std::mem::take(&mut x.target))));
+            open(l)
+        }),
+        Some(&w) => {
+            let fg = GetForegroundWindow();
+            if wins.contains(&fg) && IsIconic(fg) == 0 {
+                ShowWindow(fg, SW_MINIMIZE);
+            } else {
+                if IsIconic(w) != 0 { ShowWindow(w, SW_RESTORE); }
+                SetForegroundWindow(w);
+            }
+        }
+    }
+}
+
 unsafe fn click(h: i32, left: bool, mid: bool) {
     match h {
         SEARCH if left => {
@@ -2603,29 +2692,10 @@ unsafe fn click(h: i32, left: bool, mid: bool) {
         }
         0 if left => fly::toggle(fly::Kind::Start),
         0 => start_menu(),
+        1.. if left => activate_btn(h),
         1.. => {
-            let (wins, lnk) = BTNS.with_borrow(|b| b.get(h as usize).map(|b| (b.wins.clone(), b.pin.and_then(|p| PINS.with_borrow(|p2| p2.get(p).map(|x| x.lnk.clone()))))).unwrap_or_default());
-            match (wins.first(), left) {
-                // not running: launch the pinned app (a Store app may have updated since the pins were loaded)
-                (None, true) => lnk.iter().for_each(|l| {
-                    PINS.with_borrow_mut(|p| p.iter_mut().filter(|x| x.lnk == *l).for_each(|x| x.target = fix_msix_pin(l, &x.target).unwrap_or(std::mem::take(&mut x.target))));
-                    open(l)
-                }),
-                (Some(&w), false) => close_window(w), // right / middle click
-                (Some(&w), true) => {
-                    // like the Windows taskbar: the active app's button minimizes it, a minimized one restores, any other raises
-                    let fg = GetForegroundWindow();
-                    if wins.contains(&fg) && IsIconic(fg) == 0 {
-                        ShowWindow(fg, SW_MINIMIZE);
-                    } else {
-                        if IsIconic(w) != 0 {
-                            ShowWindow(w, SW_RESTORE);
-                        }
-                        SetForegroundWindow(w);
-                    }
-                }
-                _ => {}
-            }
+            let w = BTNS.with_borrow(|b| b.get(h as usize).and_then(|b| b.wins.first().copied()));
+            if let Some(w) = w { close_window(w); }
         }
         _ => {}
     }
@@ -2737,6 +2807,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WIN_START => fly::toggle(fly::Kind::Start),
         ALT_TAB => alt_tab(wp == 1),
         ALT_UP => alt_done(wp == 1),
+        WIN_APP => activate_btn(wp as i32 + 1),
         SNIP if wp == 1 => screenshot_notice(hwnd),
         SNIP if wp == 2 => clip_notice(hwnd),
         SNIP => clip::start(),
@@ -2813,7 +2884,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_DISPLAYCHANGE => place(hwnd),
+        WM_ENDSESSION if wp != 0 => {
+            quick::no_sleep_shutdown();
+        }
         WM_DESTROY => {
+            quick::no_sleep_shutdown();
             let mut ab: APPBARDATA = zeroed();
             ab.cbSize = size_of::<APPBARDATA>() as u32;
             ab.hWnd = hwnd;
@@ -2873,6 +2948,7 @@ fn main() {
             return; // already running
         }
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        quick::no_sleep_recover();
         // Without explorer nobody hides minimized windows: they sit as small caption stubs at the bottom left of the screen.
         // ARW_HIDE moves them off screen (this session only: fWinIni 0 does not touch the saved setting).
         let mut mm: MINIMIZEDMETRICS = zeroed();
@@ -2977,6 +3053,14 @@ mod tests {
         assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 0.0), super::rgb(0, 0, 0));
         assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 1.0), super::rgb(200, 100, 50));
         assert_eq!(super::mix(super::rgb(0, 0, 0), super::rgb(200, 100, 50), 0.5), super::rgb(100, 50, 25));
+    }
+
+    #[test]
+    fn digit_selects_taskbar_slot() {
+        assert_eq!(super::digit_index(0x31), Some(0));
+        assert_eq!(super::digit_index(0x39), Some(8));
+        assert_eq!(super::digit_index(0x30), Some(9));
+        assert_eq!(super::digit_index(0x41), None);
     }
 
     #[test]

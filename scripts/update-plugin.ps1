@@ -1,8 +1,9 @@
 ﻿# Rebuilds the plugins (cargo only recompiles what changed), refreshes payload\ and runs `plugin-launcher update`: no launcher rebuild.
-#   scripts\update-plugin.ps1 rust-search|rtaskmgr-win32|topbar|rust-explorer|wiztree|photoview|rust-settings|debloat
+#   scripts\update-plugin.ps1 rust-search|rtaskmgr-win32|topbar|rust-explorer|wiztree|photoview|rust-settings|rs-spaces|debloat
 # Build + copy need no admin. The update step does: from a normal shell this script asks for it via a UAC prompt (the user clicks Yes),
 # then prints the last lines of %ProgramData%\plugin-launcher\install.log (the elevated window's own output is lost).
-param([Parameter(Mandatory)][ValidateSet('rust-search', 'rtaskmgr-win32', 'topbar', 'rust-explorer', 'wiztree', 'photoview', 'rust-settings', 'debloat')][string]$name)
+param([Parameter(Mandatory)][ValidateSet('rust-search', 'rtaskmgr-win32', 'topbar', 'rust-explorer', 'wiztree', 'photoview', 'rust-settings', 'rs-spaces', 'debloat')
+][string]$name)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot
 & "$PSScriptRoot\build-plugins.ps1" # rebuilds what changed (and what ships with the plugin), refreshes payload\

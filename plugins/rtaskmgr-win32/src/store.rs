@@ -27,12 +27,15 @@ pub struct Settings {
     pub theme: u8, // 0 светлая, 1 тёмная, 2 как в системе
     pub etw: bool, // сеть по процессам (нужен администратор), по умолчанию выключено
     pub gpu_temp_always: bool, // читать температуру GPU и вне страницы GPU (может будить видеокарту ноутбука)
+    pub mini: bool, // компактный режим по умолчанию
+    pub mini_size: (u32, u32),
+    pub full_size: (u32, u32),
     pub rules: Vec<Rule>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { view: 0, sort: 2, desc: true, pos: (150, 60), size: (1000, 740), to_tray: true, theme: 2, etw: false, gpu_temp_always: false, rules: vec![] }
+        Self { view: 0, sort: 2, desc: true, pos: (150, 60), size: (520, 360), to_tray: true, theme: 2, etw: false, gpu_temp_always: false, mini: true, mini_size: (520, 360), full_size: (1000, 740), rules: vec![] }
     }
 }
 
@@ -43,8 +46,9 @@ pub fn dir() -> PathBuf {
 
 pub fn render(s: &Settings) -> String {
     let mut t = format!(
-        "view={}\npsort={}\ndesc={}\nx={}\ny={}\nw={}\nh={}\nto_tray={}\ntheme={}\netw={}\ngputemp={}\n",
-        s.view, s.sort, s.desc as u8, s.pos.0, s.pos.1, s.size.0, s.size.1, s.to_tray as u8, s.theme, s.etw as u8, s.gpu_temp_always as u8
+        "view={}\npsort={}\ndesc={}\nx={}\ny={}\nw={}\nh={}\nto_tray={}\ntheme={}\netw={}\ngputemp={}\nmini={}\nmw={}\nmh={}\nfw={}\nfh={}\n",
+        s.view, s.sort, s.desc as u8, s.pos.0, s.pos.1, s.size.0, s.size.1, s.to_tray as u8, s.theme, s.etw as u8, s.gpu_temp_always as u8,
+        s.mini as u8, s.mini_size.0, s.mini_size.1, s.full_size.0, s.full_size.1
     );
     for r in &s.rules {
         t += &format!("rule={}|{}|{}|{}|{}\n", r.proc, r.cpu, r.secs, if r.act == RuleAct::Lower { "lower" } else { "notify" }, r.hits);
@@ -54,6 +58,7 @@ pub fn render(s: &Settings) -> String {
 
 pub fn parse(text: &str) -> Settings {
     let mut s = Settings::default();
+    let (mut saw_mini, mut saw_mini_size, mut saw_full_size) = (false, false, false);
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k {
@@ -68,6 +73,11 @@ pub fn parse(text: &str) -> Settings {
             "theme" => s.theme = v.parse().unwrap_or(2).min(2),
             "etw" => s.etw = v == "1",
             "gputemp" => s.gpu_temp_always = v == "1",
+            "mini" => { s.mini = v == "1"; saw_mini = true; },
+            "mw" => { s.mini_size.0 = v.parse().unwrap_or(s.mini_size.0); saw_mini_size = true; },
+            "mh" => { s.mini_size.1 = v.parse().unwrap_or(s.mini_size.1); saw_mini_size = true; },
+            "fw" => { s.full_size.0 = v.parse().unwrap_or(s.full_size.0); saw_full_size = true; },
+            "fh" => { s.full_size.1 = v.parse().unwrap_or(s.full_size.1); saw_full_size = true; },
             "rule" => {
                 let p: Vec<&str> = v.split('|').collect();
                 if let [name, cpu, secs, act, hits] = p[..]
@@ -84,8 +94,22 @@ pub fn parse(text: &str) -> Settings {
             _ => {}
         }
     }
-    // защита от мусора в файле: окно не должно быть крошечным или улетать за экран
-    s.size = (s.size.0.clamp(640, 4000), s.size.1.clamp(480, 3000));
+    // старые файлы без key mini: открываем компактным окном, но сохраняем прежний размер для полного режима
+    if !saw_mini {
+        s.mini = true;
+        s.mini_size = Settings::default().mini_size;
+        s.full_size = s.size;
+    } else {
+        if !saw_mini_size { s.mini_size = s.size; }
+        if !saw_full_size { s.full_size = s.size; }
+    }
+    let clamp = |p: (u32, u32), mini: bool| {
+        let (w, h) = if mini { (360, 260) } else { (640, 480) };
+        (p.0.clamp(w, 4000), p.1.clamp(h, 3000))
+    };
+    s.mini_size = clamp(s.mini_size, true);
+    s.full_size = clamp(s.full_size, false);
+    s.size = if s.mini { s.mini_size } else { s.full_size };
     s.pos = (s.pos.0.clamp(-200, 6000), s.pos.1.clamp(-50, 4000));
     s
 }
@@ -146,9 +170,20 @@ mod tests {
     #[test]
     fn garbage_is_clamped_and_ignored() {
         let s = parse("w=1\nh=99999\nx=-99999\nrule=bad\nnonsense\nview=abc");
-        assert_eq!(s.size, (640, 3000));
+        assert_eq!(s.size, (520, 360));
+        assert_eq!(s.full_size, (640, 3000));
         assert_eq!(s.pos.0, -200);
         assert!(s.rules.is_empty());
         assert_eq!(s.view, 0);
+        assert!(s.mini);
+    }
+
+    #[test]
+    fn old_settings_open_in_mini_and_keep_full_size() {
+        let s = parse("w=846\nh=625\nview=2");
+        assert!(s.mini);
+        assert_eq!(s.size, (520, 360));
+        assert_eq!(s.mini_size, (520, 360));
+        assert_eq!(s.full_size, (846, 625));
     }
 }

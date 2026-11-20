@@ -39,6 +39,8 @@ thread_local! {
 /// The list shows search hits for `q` (None: a folder again); the pill says so instead of showing the path.
 pub fn set_search(q: Option<String>) { SEARCHING.set(q); }
 
+pub fn searching() -> bool { SEARCHING.with_borrow(|s| s.is_some()) }
+
 /// Folder of the path part `i` of the address pill.
 pub fn crumb_path(i: usize) -> Option<PathBuf> { CRUMBS.with_borrow(|c| c.get(i).map(|x| x.1.clone())) }
 
@@ -190,6 +192,7 @@ pub fn row_height(list: HWND, on: bool) {
 
 thread_local! {
     static ROWHOT: Cell<isize> = const { Cell::new(-1) }; // list row under the pointer
+    static DROPHOT: Cell<isize> = const { Cell::new(-1) }; // folder row under a dragged file
     static FONTS: Cell<(isize, isize)> = const { Cell::new((0, 0)) }; // (name, details) fonts of the list rows
 }
 
@@ -241,8 +244,8 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
                 let mut st = c.try_borrow_mut().ok()?;
                 let State { dir, rows, .. } = &mut *st;
                 let r = rows.get_mut(i)?;
-                if r.icon < 0 { r.icon = icon_of(&dir.join(&r.name), r.dir); }
-                Some((r.name.clone(), r.dir, r.time, r.size, r.icon))
+                if r.icon < 0 { r.icon = icon_of(&row_path(dir, &r.name), r.dir); }
+                Some((r.title.clone(), r.dir, r.time, r.size, r.icon))
             });
             let Some((name, is_dir, time, size, icon)) = row else { return CDRF_DODEFAULT as isize };
             let mut r = RECT { left: LVIR_BOUNDS as i32, ..std::mem::zeroed() };
@@ -252,14 +255,18 @@ pub unsafe fn list_draw(lp: LPARAM) -> LRESULT {
             FillRect(dc, &row_r, b);
             DeleteObject(b);
             let sel = SendMessageW(list, LVM_GETITEMSTATE, i, LVIS_SELECTED as isize) as u32 & LVIS_SELECTED != 0;
-            let hot = ROWHOT.get() == i as isize;
+            let hot = ROWHOT.get() == i as isize || DROPHOT.get() == i as isize;
             let focus = GetFocus() == list;
             let pill = rc(sc(6), r.top + sc(2), cr.right - sc(6), r.bottom - sc(2));
-            let bg = match (sel, focus) {
-                (true, true) => mix(listbg(), pal().accent, if hot { 0.26 } else { 0.20 }),
-                (true, false) => mix(listbg(), pal().text, 0.10),
-                _ if hot => mix(listbg(), pal().text, 0.055),
-                _ => listbg(),
+            let bg = if DROPHOT.get() == i as isize {
+                mix(listbg(), pal().accent, 0.32)
+            } else {
+                match (sel, focus) {
+                    (true, true) => mix(listbg(), pal().accent, if hot { 0.26 } else { 0.20 }),
+                    (true, false) => mix(listbg(), pal().text, 0.10),
+                    _ if hot => mix(listbg(), pal().text, 0.055),
+                    _ => listbg(),
+                }
             };
             if bg != listbg() { fill(dc, pill, bg, sc(10)); }
             if sel { fill(dc, rc(pill.left, pill.top + sc(8), pill.left + sc(3), pill.bottom - sc(8)), if focus { pal().accent } else { pal().dim }, sc(3)); }
@@ -307,6 +314,16 @@ unsafe fn redraw_row(list: HWND, i: isize) {
         let mut cr: RECT = std::mem::zeroed();
         GetClientRect(list, &mut cr);
         InvalidateRect(list, &rc(0, r.top, cr.right, r.bottom), 0);
+    }
+}
+
+pub unsafe fn drop_row(i: Option<isize>) {
+    let list = ST.with_borrow(|s| s.list);
+    let next = i.unwrap_or(-1);
+    let old = DROPHOT.replace(next);
+    if old != next {
+        redraw_row(list, old);
+        redraw_row(list, next);
     }
 }
 
@@ -730,10 +747,34 @@ fn nav_h(it: &NavItem) -> i32 {
     sc(if it.path.as_os_str().is_empty() { NAV_HEAD } else if it.cap.is_some() { NAV_DRIVE } else { NAV_ROW })
 }
 
+/// Bottom of the Quick access section (the point where "This PC" starts).
+fn nav_quick_bottom() -> i32 {
+    let mut top = sc(8);
+    NAV.with_borrow(|n| {
+        for it in n {
+            if it.path.as_os_str().is_empty() && it.title == "This PC" { return top; }
+            top += nav_h(it);
+        }
+        top
+    })
+}
+
 thread_local! {
     static NAV: RefCell<Vec<NavItem>> = const { RefCell::new(Vec::new()) };
     static NAVWND: Cell<isize> = const { Cell::new(0) };
     static NAVHOT: Cell<i32> = const { Cell::new(-1) };
+    static NAVDROP: Cell<bool> = const { Cell::new(false) };
+}
+
+fn nav_quick_file() -> PathBuf { PathBuf::from(env::var_os("APPDATA").unwrap_or_default()).join(r"rust-explorer\quick-access.txt") }
+
+fn nav_same_path(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    norm(a) == norm(b)
+}
+
+fn nav_saved() -> Vec<PathBuf> {
+    fs::read_to_string(nav_quick_file()).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect()
 }
 
 /// Folders the user pinned to Quick access: %APPDATA%\WinRust\rust-explorer-pins.txt, one path per line.
@@ -768,6 +809,13 @@ pub fn nav_init(h: HWND) {
     for p in pins() {
         if p.is_dir() { v.push(NavItem { title: p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned()), path: p, glyph: "\u{E718}", cap: None }); }
     }
+    let mut known: Vec<PathBuf> = v.iter().map(|x| x.path.clone()).collect();
+    for p in nav_saved() {
+        if known.iter().any(|x| nav_same_path(x, &p)) { continue; }
+        let title = p.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| p.to_string_lossy().into_owned());
+        known.push(p.clone());
+        v.push(NavItem { title, path: p, glyph: "\u{E8B7}", cap: None });
+    }
     v.push(head("This PC"));
     unsafe {
         use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
@@ -792,6 +840,14 @@ pub fn nav_init(h: HWND) {
             v.push(NavItem { title: format!("{} ({letter}:)", if name.is_empty() { "Local Disk" } else { &name }), path: PathBuf::from(root), glyph: "\u{EDA2}", cap });
         }
     }
+    let devices = shell_devices();
+    if !devices.is_empty() {
+        v.push(head("Portable Devices"));
+        for (title, path, _) in devices {
+            remember_shell_title(&path, &title);
+            v.push(NavItem { title, path, glyph: "\u{E8BD}", cap: None });
+        }
+    }
     NAV.with_borrow_mut(|n| *n = v);
 }
 
@@ -799,10 +855,52 @@ pub fn nav_path(i: usize) -> Option<PathBuf> {
     NAV.with_borrow(|n| n.get(i).map(|x| x.path.clone()).filter(|p| !p.as_os_str().is_empty()))
 }
 
+pub fn nav_refresh() {
+    let h = NAVWND.get() as HWND;
+    if !h.is_null() {
+        nav_init(h);
+        nav_dirty();
+    }
+}
+
 pub fn nav_dirty() {
     let h = NAVWND.get() as HWND;
     if !h.is_null() { unsafe { InvalidateRect(h, ptr::null(), 0) }; }
 }
+
+/// Pins folders to Quick access and returns how many were really added.
+pub fn nav_add(paths: &[PathBuf]) -> usize {
+    let mut saved = nav_saved();
+    let mut known: Vec<PathBuf> = NAV.with_borrow(|n| n.iter().map(|x| x.path.clone()).collect());
+    let mut added = 0;
+    for p in paths.iter().filter(|p| p.is_dir()) {
+        if known.iter().any(|x| nav_same_path(x, p)) { continue; }
+        known.push(p.clone());
+        saved.push(p.clone());
+        added += 1;
+    }
+    if added == 0 { return 0; }
+    let f = nav_quick_file();
+    let _ = fs::create_dir_all(f.parent().unwrap_or(&f));
+    let text: String = saved.iter().map(|p| format!("{}\n", p.to_string_lossy())).collect();
+    if fs::write(f, text).is_err() { return 0; }
+    let at = NAV.with_borrow(|n| n.iter().position(|x| x.path.as_os_str().is_empty() && x.title == "This PC").unwrap_or(n.len()));
+    NAV.with_borrow_mut(|n| {
+        for p in saved.iter().rev().take(added) {
+            let title = p.file_name().map(|x| x.to_string_lossy().into_owned()).filter(|x| !x.is_empty()).unwrap_or_else(|| p.to_string_lossy().into_owned());
+            n.insert(at, NavItem { title, path: p.clone(), glyph: "\u{E8B7}", cap: None });
+        }
+    });
+    nav_dirty();
+    added
+}
+
+/// True while a drop is over the Quick access section.
+pub fn nav_drop_at(y: i32) -> bool { y >= sc(8) && y < nav_quick_bottom() }
+
+pub fn nav_drop_begin() { if !NAVDROP.replace(true) { nav_dirty(); } }
+
+pub fn nav_drop_end() { if NAVDROP.replace(false) { nav_dirty(); } }
 
 /// Chrome on top, the pane on the left (hidden when the window is narrow), the list takes the rest.
 pub unsafe fn layout_children(cw: i32, ch: i32) {
@@ -810,10 +908,11 @@ pub unsafe fn layout_children(cw: i32, ch: i32) {
     let nav = NAVWND.get() as HWND;
     let (top, status) = (sc(CHROME_H), sc(STATUS_H));
     let nw = if cw > sc(760) { sc(NAV_W) } else { 0 };
-    let h = (ch - top - status).max(0);
+    let reserve = super::cover::reserve();
+    let h = (ch - top - status - reserve).max(0);
     MoveWindow(chrome, 0, 0, cw, top, 1);
-    MoveWindow(nav, 0, top, nw, h, 1);
-    MoveWindow(list, nw, top, cw - nw, h, 1);
+    MoveWindow(nav, 0, top, nw, h + reserve, 1);
+    MoveWindow(list, nw, top + reserve, cw - nw, h, 1);
     fit_columns(list);
 }
 
@@ -841,6 +940,7 @@ unsafe fn paint_nav(hwnd: HWND) {
     let bg = CreateSolidBrush(pal().bg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
+    if NAVDROP.get() { fill(dc, rc(sc(4), sc(8), cr.right - sc(4), nav_quick_bottom()), mix(pal().bg, pal().accent, 0.22), sc(10)); }
     SetBkMode(dc, TRANSPARENT as i32);
     let (f_txt, f_head, f_glyph, f_small) = (font(13, 400, ui_face()) as HFONT, font(12, 600, ui_face()) as HFONT, font(16, 400, winrust_common::style::icon_face()) as HFONT, font(11, 400, ui_face()) as HFONT);
     let of = SelectObject(dc, f_txt);
@@ -853,7 +953,8 @@ unsafe fn paint_nav(hwnd: HWND) {
         for (i, it) in n.iter().enumerate() {
             if it.path.as_os_str().is_empty() {
                 SelectObject(dc, f_head);
-                text(dc, &it.title.to_uppercase(), rc(sc(18), y + sc(6), cr.right - sc(8), y + sc(NAV_HEAD)), pal().dim, DT_LEFT);
+                let head = if NAVDROP.get() && it.title == "Quick access" { "QUICK ACCESS - DROP TO PIN".to_string() } else { it.title.to_uppercase() };
+                text(dc, &head, rc(sc(18), y + sc(6), cr.right - sc(8), y + sc(NAV_HEAD)), pal().dim, DT_LEFT);
                 y += sc(NAV_HEAD);
                 continue;
             }

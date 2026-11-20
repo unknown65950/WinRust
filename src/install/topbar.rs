@@ -53,7 +53,7 @@ pub(crate) fn bar_install() -> Result<(), String> {
         put(&d.join("topbar.exe"), &dst)?;
         fs::create_dir_all(tm_dir()).map_err(|e| e.to_string())?;
         put(&d.join("rs-du.exe"), &tm_dir().join("rs-du.exe"))?; // topbar menu "Чистильщик диска"
-        let rsh = bar_dir().join("reshell.exe"); // Win+1/2/3 desktop hotkeys, no args = hotkeys
+        let rsh = bar_dir().join("reshell.exe");
         let _ = run("taskkill", &["/f", "/im", "reshell.exe"]);
         put(&d.join("reshell.exe"), &rsh)?;
         run("reg", &["add", RUN_KEY, "/v", "reshell", "/t", "REG_SZ", "/d", &format!("\"{}\"", rsh.display()), "/f"])?;

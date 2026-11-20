@@ -12,6 +12,7 @@ use winapi::um::winuser::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Btn {
+    Search,
     RunTask,
     EndTask,
     Efficiency,
@@ -77,6 +78,8 @@ pub struct Ui {
     pub toast: Option<(String, Instant)>,
     pub tip: Option<(String, (i32, i32))>,
     pub lay: Option<Lay>,
+    pub mini: bool,
+    pub search_open: bool,
     pub last_click: Option<(Instant, String)>,
 }
 
@@ -115,6 +118,7 @@ pub enum Act {
     Export,
     SetTheme(u8),
     ToggleTray,
+    ToggleMini,
     ToggleAutostart,
     ToggleEtw,
     ToggleGpuTemp,
@@ -179,37 +183,60 @@ impl App {
     pub fn compute_layout(&self, g: &G, ui: &Ui, d: &Data, w: i32, h: i32) -> Lay {
         let s = g.s;
         let px = |v: f64| (v * s).round() as i32;
-        let nav_w = px(if ui.nav_open { NAV_W_OPEN } else { NAV_W });
-        let nav = R::new(0, 0, nav_w, h);
-        let nav_toggle = R::new(0, px(6.0), px(NAV_W), px(6.0 + 44.0));
-        let nav_items: Vec<R> = (0..NAV.len()).map(|i| R::new(0, px(56.0 + i as f64 * 44.0), nav_w, px(56.0 + i as f64 * 44.0 + 44.0))).collect();
-        let band = R::new(nav_w, 0, w, px(BAND_H));
-        let title = R::new(band.l + px(20.0), 0, band.l + px(320.0), band.b);
-        // кнопки справа налево
-        let mut buttons = vec![];
-        let mut right = band.r - px(12.0);
-        for (btn, label, glyph) in page_buttons(ui.page).into_iter().rev() {
-            let bw = if label.is_empty() { px(36.0) } else { g.text_w(label, Font::Ui) + px(48.0) };
-            let r = R::new(right - bw, px(10.0), right, px(10.0 + 32.0));
-            buttons.push((r, btn, label, glyph));
-            right -= bw + px(4.0);
+        let (nav, nav_toggle, nav_items, band, title, buttons, search, body);
+        if ui.mini {
+            let (bh, nh) = (px(MINI_BAND_H), px(MINI_NAV_H));
+            band = R::new(0, 0, w, bh);
+            nav = R::new(0, h - nh, w, h);
+            nav_toggle = R::new(0, 0, 0, 0);
+            let (cell, gap) = (px(30.0), px(4.0));
+            let mut x = (w - (NAV.len() as i32 * (cell + gap) - gap)) / 2;
+            nav_items = NAV.iter().map(|_| {
+                let r = R::new(x, nav.t + (nh - cell) / 2, x + cell, nav.t + (nh - cell) / 2 + cell);
+                x += cell + gap;
+                r
+            }).collect();
+            title = R::new(0, 0, 0, 0);
+            let mut entries = vec![];
+            if ui.page_has_search() { entries.push((Btn::Search, t!("Поиск", "Search"), '\u{E721}')); }
+            entries.extend(page_buttons(ui.page));
+            let (bw, bgap) = (px(52.0), px(4.0));
+            let mut bx = px(6.0);
+            buttons = entries.into_iter().map(|(btn, label, glyph)| {
+                let r = R::new(bx, px(3.0), bx + bw, bh - px(3.0));
+                bx += bw + bgap;
+                (r, btn, label, glyph)
+            }).collect();
+            let l = (bx + bgap).min((w - px(140.0)).max(px(6.0)));
+            let rr = (l + px(140.0)).min(w - px(8.0));
+            search = if ui.page_has_search() && ui.search_open { R::new(l, px(12.0), rr.max(l + px(60.0)), px(42.0)) } else { R::new(0, 0, 0, 0) };
+            body = R::new(0, band.b, w, nav.t);
+        } else {
+            let nav_w = px(if ui.nav_open { NAV_W_OPEN } else { NAV_W });
+            nav = R::new(0, 0, nav_w, h);
+            nav_toggle = R::new(0, px(6.0), px(NAV_W), px(6.0 + 44.0));
+            nav_items = (0..NAV.len()).map(|i| R::new(0, px(56.0 + i as f64 * 44.0), nav_w, px(56.0 + i as f64 * 44.0 + 44.0))).collect();
+            band = R::new(nav_w, 0, w, px(BAND_H));
+            title = R::new(band.l + px(20.0), 0, band.l + px(320.0), band.b);
+            let mut bs = vec![];
+            let mut right = band.r - px(12.0);
+            for (btn, label, glyph) in page_buttons(ui.page).into_iter().rev() {
+                let bw = if label.is_empty() { px(36.0) } else { g.text_w(label, Font::Ui) + px(48.0) };
+                let r = R::new(right - bw, px(10.0), right, px(10.0 + 32.0));
+                bs.push((r, btn, label, glyph));
+                right -= bw + px(4.0);
+            }
+            bs.reverse();
+            let btn_left = bs.first().map_or(band.r, |b| b.0.l);
+            let sw = px(440.0).min((btn_left - title.l - px(220.0)).max(px(160.0)));
+            let sx = (band.l + btn_left) / 2 - sw / 2 + px(60.0);
+            let sl = sx.max(title.l + px(190.0));
+            search = R::new(sl, px(10.0), sl + sw, px(10.0 + 32.0));
+            buttons = bs;
+            body = R::new(nav_w, band.b, w, h);
         }
-        buttons.reverse();
-        let btn_left = buttons.first().map_or(band.r, |b| b.0.l);
-        let sw = px(440.0).min((btn_left - title.l - px(220.0)).max(px(160.0)));
-        let sx = (band.l + btn_left) / 2 - sw / 2 + px(60.0);
-        let search = R::new(sx.max(title.l + px(190.0)), px(10.0), (sx.max(title.l + px(190.0))) + sw, px(10.0 + 32.0));
-        let body = R::new(nav_w, band.b, w, h);
         let mut lay = Lay {
-            client: R::new(0, 0, w, h),
-            nav,
-            nav_toggle,
-            nav_items,
-            band,
-            title,
-            search,
-            buttons,
-            body,
+            client: R::new(0, 0, w, h), nav, nav_toggle, nav_items, band, title, search, buttons, body,
             header: R::new(0, 0, 0, 0),
             rows_area: R::new(0, 0, 0, 0),
             col_x: vec![],
@@ -221,7 +248,7 @@ impl App {
         };
         if ui.has_table() {
             let cols = columns(ui.page);
-            let hh = px(if ui.page == Page::Processes { 56.0 } else { 36.0 });
+            let hh = px(if ui.mini { 28.0 } else if ui.page == Page::Processes { 56.0 } else { 36.0 });
             lay.header = R::new(body.l, body.t, body.r, body.t + hh);
             lay.rows_area = R::new(body.l, body.t + hh, body.r, body.b);
             let fixed: f64 = cols.iter().map(|c| c.w).sum();
@@ -236,11 +263,12 @@ impl App {
         }
         match ui.page {
             Page::Performance => {
-                lay.perf_list = R::new(body.l, body.t, body.l + px(268.0), body.b);
+                let pl = px(if ui.mini { 148.0 } else { 268.0 });
+                lay.perf_list = R::new(body.l, body.t, body.l + pl, body.b);
                 let n = perf_kinds(d).len().max(1) as i32;
-                let item_h = px(76.0).min((body.h() - px(16.0)) / n); // при множестве устройств пункты сжимаются
+                let item_h = px(if ui.mini { 52.0 } else { 76.0 }).min((body.h() - px(16.0)) / n);
                 lay.perf_items = (0..n).map(|i| R::new(lay.perf_list.l + px(6.0), body.t + px(8.0) + i * item_h, lay.perf_list.r - px(6.0), body.t + px(8.0) + (i + 1) * item_h)).collect();
-                lay.perf_main = R::new(lay.perf_list.r + px(24.0), body.t + px(16.0), body.r - px(24.0), body.b - px(12.0));
+                lay.perf_main = R::new(lay.perf_list.r + px(if ui.mini { 8.0 } else { 24.0 }), body.t + px(16.0), body.r - px(if ui.mini { 8.0 } else { 24.0 }), body.b - px(12.0));
             }
             Page::Settings => {
                 let ids = [SettingId::Theme, SettingId::Tray, SettingId::Autostart, SettingId::Etw, SettingId::GpuTemp];
@@ -249,7 +277,6 @@ impl App {
             }
             _ => {}
         }
-        let _ = d;
         lay
     }
 
@@ -323,7 +350,7 @@ impl App {
     pub fn place_search(&self) {
         let ui = self.ui.borrow();
         let Some(lay) = &ui.lay else { return };
-        let show = ui.page_has_search();
+        let show = ui.page_has_search() && (!ui.mini || ui.search_open);
         let s = self.scale;
         let r = lay.search;
         if self.search_rect.get() != r || self.search.visible() != show {
@@ -386,7 +413,7 @@ impl App {
     pub fn btn_enabled(&self, ui: &Ui, d: &Data, b: Btn) -> bool {
         let has_sel = ui.sel.is_some();
         match b {
-            Btn::RunTask | Btn::More => true,
+            Btn::Search | Btn::RunTask | Btn::More => true,
             Btn::EndTask | Btn::Efficiency | Btn::SvcStart | Btn::SvcStop | Btn::StartEnable | Btn::StartDisable | Btn::RuleDelete | Btn::BoostOn | Btn::BoostOff => {
                 let _ = d;
                 has_sel
@@ -651,6 +678,7 @@ impl App {
             ui.scroll = 0.0;
             ui.sel = None;
             ui.search.clear();
+            ui.search_open = false;
             ui.rows.clear();
             ui.tip = None;
         }
@@ -753,6 +781,12 @@ impl App {
     // ================= кнопки, настройки =================
     fn on_button(&self, hwnd: HWND, b: Btn) {
         match b {
+            Btn::Search => {
+                let open = { let mut u = self.ui.borrow_mut(); u.search_open = !u.search_open; u.search_open };
+                self.place_search();
+                if open { self.search.set_focus(); }
+                self.invalidate();
+            }
             Btn::RunTask => self.do_act(Act::RunTask),
             Btn::EndTask => self.do_act(Act::EndTask),
             Btn::Efficiency => self.do_act(Act::Efficiency),
@@ -836,10 +870,12 @@ impl App {
 
     fn more_menu(&self) -> Vec<MI> {
         let d = self.data.borrow();
+        let mini = self.ui.borrow().mini;
         vec![
             MI::Item(t!("Запустить новую задачу", "Run new task"), Act::RunTask),
             MI::Item(t!("Экспорт в CSV", "Export to CSV"), Act::Export),
             MI::Sep,
+            MI::Check(t!("Компактный режим", "Compact mode"), Act::ToggleMini, mini),
             MI::Sub(t!("Тема", "Theme"), vec![MI::Check(t!("Светлая", "Light"), Act::SetTheme(0), d.cfg.theme == 0), MI::Check(t!("Тёмная", "Dark"), Act::SetTheme(1), d.cfg.theme == 1), MI::Check(t!("Системная", "System"), Act::SetTheme(2), d.cfg.theme == 2)]),
             MI::Item(t!("Параметры", "Settings"), Act::Go(Page::Settings)),
         ]
@@ -850,9 +886,11 @@ impl App {
 
     pub fn tray_menu(&self) -> Vec<MI> {
         let d = self.data.borrow();
+        let mini = self.ui.borrow().mini;
         vec![
             MI::Item(t!("Показать окно", "Show window"), Act::ShowWindow),
             MI::Sep,
+            MI::Check(t!("Компактный режим", "Compact mode"), Act::ToggleMini, mini),
             MI::Check(t!("Закрытие окна сворачивает в трей", "Closing the window minimizes to tray"), Act::ToggleTray, d.cfg.to_tray),
             MI::Check(t!("Запускать при входе в Windows", "Start with Windows"), Act::ToggleAutostart, startup::self_autostart()),
             MI::Check(t!("Сеть по процессам (ETW, администратор)", "Per-process network (ETW, administrator)"), Act::ToggleEtw, d.etw.is_some()),
@@ -910,6 +948,29 @@ impl App {
                     d.cfg.to_tray
                 };
                 self.toast(if on { t!("Закрытие окна будет сворачивать в трей", "Closing the window will minimize to tray") } else { t!("Закрытие окна завершит программу", "Closing the window will quit the program") });
+                self.save_settings();
+                return;
+            }
+            Act::ToggleMini => {
+                let old = self.win.size();
+                let mini = {
+                    let mut u = self.ui.borrow_mut();
+                    u.mini = !u.mini;
+                    u.search_open = false;
+                    u.mini
+                };
+                {
+                    let mut d = self.data.borrow_mut();
+                    if mini { d.cfg.full_size = old; } else { d.cfg.mini_size = old; }
+                    d.cfg.mini = mini;
+                }
+                let size = {
+                    let d = self.data.borrow();
+                    if mini { d.cfg.mini_size } else { d.cfg.full_size }
+                };
+                self.win.set_size(size.0, size.1);
+                self.search.set_visible(false);
+                self.invalidate();
                 self.save_settings();
                 return;
             }
@@ -1222,10 +1283,12 @@ impl App {
         d.cfg.desc = sd;
         d.cfg.rules = d.rules.clone();
         d.cfg.etw = d.etw.is_some();
+        d.cfg.mini = ui.mini;
         let (p, s) = (self.win.position(), self.win.size());
         if p.0 > -10000 && s.0 > 100 {
             d.cfg.pos = p;
             d.cfg.size = s;
+            if ui.mini { d.cfg.mini_size = s; } else { d.cfg.full_size = s; }
         }
         store::save(&d.cfg);
     }

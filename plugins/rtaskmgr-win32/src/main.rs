@@ -177,6 +177,8 @@ fn main() {
         toast: None,
         tip: None,
         lay: None,
+        mini: cfg.mini,
+        search_open: false,
         last_click: None,
     };
     let app = Rc::new(App {
@@ -219,7 +221,8 @@ fn main() {
             WM_ERASEBKGND => Some(1),
             WM_GETMINMAXINFO => unsafe {
                 let mmi = &mut *(l as *mut MINMAXINFO);
-                mmi.ptMinTrackSize = winapi::shared::windef::POINT { x: (860.0 * a.scale) as i32, y: (560.0 * a.scale) as i32 };
+                let (mw, mh) = if a.ui.borrow().mini { (360.0, 260.0) } else { (860.0, 560.0) };
+                mmi.ptMinTrackSize = winapi::shared::windef::POINT { x: (mw * a.scale) as i32, y: (mh * a.scale) as i32 };
                 Some(0)
             },
             WM_SIZE => {

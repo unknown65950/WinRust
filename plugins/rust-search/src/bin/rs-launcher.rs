@@ -30,7 +30,7 @@ use windows_sys::Win32::{
         },
     },
     Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT},
-    System::LibraryLoader::GetModuleHandleW,
+    System::{LibraryLoader::GetModuleHandleW, Threading::{AttachThreadInput, GetCurrentThreadId}},
     UI::{
         Input::KeyboardAndMouse::*,
         Shell::{
@@ -183,6 +183,21 @@ unsafe fn start_anim(h: HWND) {
     SetTimer(h, T_ANIM, 15, None);
 }
 
+unsafe fn focus(h: HWND) {
+    if SetForegroundWindow(h) != 0 && GetForegroundWindow() == h {
+        SetFocus(h);
+        return;
+    }
+    let me = GetCurrentThreadId();
+    let ft = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+    let attached = ft != 0 && ft != me && AttachThreadInput(me, ft, 1) != 0;
+    SetForegroundWindow(h);
+    if attached {
+        AttachThreadInput(me, ft, 0);
+    }
+    SetFocus(h);
+}
+
 unsafe fn show(h: HWND) {
     let (x, y) = {
         let mut pt: POINT = zeroed();
@@ -208,7 +223,7 @@ unsafe fn show(h: HWND) {
     let (w, hgt, slide) = st(|s| ((W as f32 * s.scale) as i32, s.height as i32, s.slide as i32));
     SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
     SetWindowPos(h, HWND_TOPMOST, x, y + slide, w, hgt, SWP_SHOWWINDOW);
-    SetForegroundWindow(h);
+    focus(h);
     SetTimer(h, T_CARET, 530, None);
     start_anim(h);
 }

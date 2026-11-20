@@ -379,6 +379,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-spaces"
+version = "0.1.0"
+dependencies = [
+ "embed-resource",
+ "windows-sys",
+]
+
+[[package]]
 name = "rtaskmgr-win32"
 version = "0.1.0"
 dependencies = [

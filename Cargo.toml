@@ -28,6 +28,7 @@ members = [
     "plugins/topbar",
     "plugins/rtaskmgr-win32",
     "plugins/rs-du",
+    "plugins/rs-spaces",
     "plugins/rust-explorer",
     "plugins/rs-shell",
     "plugins/wiztree",

@@ -99,7 +99,7 @@ const PLUGINS: &[Plugin] = &[
     },
     Plugin {
         name: "topbar",
-        desc: Tr("Нижняя панель в стиле Windows 11 вместо панели задач: окна, часы, меню. Стандартная панель скрывается. Вместе с ней ставятся хоткеи рабочих столов (Win+1/2/3, Win+`).", "A Windows 11-style bottom bar instead of the taskbar: windows, clock, menus. The stock taskbar is hidden. Desktop hotkeys (Win+1/2/3, Win+`) are installed with it."),
+        desc: Tr("Нижняя панель в стиле Windows 11 вместо панели задач: окна, часы, меню. Стандартная панель скрывается. Win+1..9/0 открывают иконки приложений на панели.", "A Windows 11-style bottom bar instead of the taskbar: windows, clock, menus. The stock taskbar is hidden. Win+1..9/0 activate app icons on the bar."),
         warn: Tr("Панель задач Windows будет СКРЫТА и заменена панелью внизу экрана. Удаление плагина возвращает её.", "The Windows taskbar will be HIDDEN and replaced by a bar at the bottom of the screen. Uninstalling the plugin brings it back."),
         installed: || bar_dir().join("topbar.exe").is_file(),
         actions: Some((bar_install, bar_uninstall)),
@@ -146,6 +146,16 @@ const PLUGINS: &[Plugin] = &[
         settings: false,
         bulk: true,
         glyph: "\u{E713}", // settings
+    },
+    Plugin {
+        name: "rs-spaces",
+        desc: Tr("Свои виртуальные пространства поверх обычного рабочего стола: Alt+1..9/0 переключают их, Alt+` возвращает на предыдущее, Alt+цифра с зажатой мышью переносит окно. Не использует Virtual Desktop из Windows 10 и не создаёт NT-десктопы.", "Custom virtual spaces on top of the normal desktop: Alt+1..9/0 switch them, Alt+` returns to the previous one, Alt+digit with the mouse held moves a window. Uses neither Win10 virtual desktops nor NT desktops."),
+        warn: Tr("Окна неактивного пространства скрываются (SW_HIDE) и показываются при возврате. При аварийном завершении процесс оставляет журнал скрытых окон; `rs-spaces.exe --restore` или повторный запуск возвращает их. Системные настройки не меняются, добавляется только автозапуск в HKCU.", "Windows of the inactive space are hidden (SW_HIDE) and shown again on return. After a crash the process leaves a journal of hidden windows; `rs-spaces.exe --restore` or the next start brings them back. No system settings change, only an HKCU autostart value is added."),
+        installed: || sp_dir().join("rs-spaces.exe").is_file(),
+        actions: Some((sp_install, sp_uninstall)),
+        settings: false,
+        bulk: true,
+        glyph: "\u{E7FC}",
     },
     Plugin {
         name: "debloat",

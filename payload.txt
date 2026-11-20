@@ -4,6 +4,7 @@ rs.exe = plugins/rust-search/target/release/rs.exe
 rs-launcher.exe = plugins/rust-search/target/release/rs-launcher.exe
 Task manager.exe = target/release/rtaskmgr-win32.exe
 rs-du.exe = target/release/rs-du.exe
+rs-spaces.exe = target/release/rs-spaces.exe
 topbar.exe = target/release/topbar.exe
 reshell.exe = target/release/reshell.exe
 rust-explorer.exe = target/release/rust-explorer.exe

@@ -23,6 +23,10 @@ pub(crate) fn db_dir() -> PathBuf {
     program_files().join("debloat")
 }
 
+pub(crate) fn sp_dir() -> PathBuf {
+    program_files().join("rs-spaces")
+}
+
 /// Copies `exe` out of the payload into `dir` (an update: the running copy is killed first) and adds the Start Menu shortcut `lnk`.
 pub(crate) fn tool_install(exe: &str, dir: &Path, lnk: Option<&str>) -> Result<(), String> {
     with_payload(&[exe], |d| {
@@ -63,6 +67,33 @@ pub(crate) fn wz_install() -> Result<(), String> {
 
 pub(crate) fn wz_uninstall() -> Result<(), String> {
     tool_remove("wiztree.exe", &wz_dir(), Some("WinRust Disk"));
+    Ok(())
+}
+
+pub(crate) fn sp_install() -> Result<(), String> {
+    with_payload(&["rs-spaces.exe"], |d| {
+        let dir = sp_dir();
+        let dst = dir.join("rs-spaces.exe");
+        if dst.is_file() {
+            let _ = run(dst.to_str().unwrap(), &["--restore"]);
+        }
+        let _ = run("taskkill", &["/f", "/im", "rs-spaces.exe"]);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        put(&d.join("rs-spaces.exe"), &dst)?;
+        run("reg", &["add", RUN_KEY, "/v", "rs-spaces", "/t", "REG_SZ", "/d", &format!("\"{}\"", dst.display()), "/f"])?;
+        let _ = Command::new("explorer.exe").arg(&dst).spawn();
+        Ok(())
+    })
+}
+
+pub(crate) fn sp_uninstall() -> Result<(), String> {
+    let dst = sp_dir().join("rs-spaces.exe");
+    if dst.is_file() {
+        let _ = run(dst.to_str().unwrap(), &["--restore"]);
+    }
+    let _ = run("reg", &["delete", RUN_KEY, "/v", "rs-spaces", "/f"]);
+    let _ = run("taskkill", &["/f", "/im", "rs-spaces.exe"]);
+    let _ = fs::remove_dir_all(sp_dir());
     Ok(())
 }
 

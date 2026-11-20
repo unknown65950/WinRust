@@ -582,7 +582,7 @@ unsafe fn wifi_join(n: &Net, pass: &str) {
 
 fn size(k: Kind) -> (i32, i32) {
     match k {
-        Kind::Quick => (360, 252 + 44 * sliders()),
+        Kind::Quick => (360, 336 + 44 * sliders()),
         Kind::Cal => (330, 340),
         Kind::Wifi => (360, wifi_rows().2),
         Kind::Start => (560, 640),
@@ -648,16 +648,16 @@ fn rects(k: Kind) -> Vec<(RECT, Act)> {
     let (w, h) = size(k);
     match k {
         Kind::Quick => {
-            // a 3x2 grid of tiles; the Wi-Fi tile has a round "more" button in its corner (found first: act_at searches backwards)
+            // a 3x3 grid of tiles; the Wi-Fi tile has a round "more" button in its corner (found first: act_at searches backwards)
             let mut v = vec![];
-            for i in 0..6u8 {
+            for i in 0..7u8 {
                 let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
                 v.push((r(tl, tt, tl + 104, tt + 76), Act::Tile(i)));
                 if i == 0 {
                     v.push((r(tl + 66, tt + 8, tl + 96, tt + 38), Act::WifiMore));
                 }
             }
-            let mut y = 188;
+            let mut y = 272;
             if BRIGHT.load(Relaxed) >= 0 {
                 v.push((r(64, y, w - 24, y + 40), Act::BrightSlide));
                 y += 44;
@@ -1048,7 +1048,11 @@ unsafe fn run_act(a: Act, rect: RECT, x: i32) {
                     _ => crate::quick::set_keys(true, !filter),
                 });
             }
-            _ => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
+            4 => crate::quick::set_energy_saver(!crate::quick::energy_saver()),
+             _ => match crate::quick::no_sleep_toggle() {
+                 Ok(_) => {}
+                 Err(e) => NOTE.set(e.to_string()),
+             },
         },
         Act::Mute => toggle_mute(),
         Act::Menu(i) => {
@@ -1226,13 +1230,13 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 _ if NETS.with_borrow(|n| n.is_empty()) => t!("Выключен", "Off").into(),
                 _ => t!("Не подключено", "Not connected").into(),
             };
-            let (bt, air, acc, eco) = (crate::quick::bluetooth(), crate::quick::airplane(), crate::quick::accessibility_on(), crate::quick::energy_saver());
+            let (bt, air, acc, eco, nosleep) = (crate::quick::bluetooth(), crate::quick::airplane(), crate::quick::accessibility_on(), crate::quick::energy_saver(), crate::quick::no_sleep());
             let onoff = |b: Option<bool>| match b {
                 Some(true) => t!("Вкл.", "On").to_string(),
                 Some(false) => t!("Выкл.", "Off").to_string(),
                 None => t!("Нет", "None").to_string(),
             };
-            let states = [q >= 0, bt == Some(true), air == Some(true), acc, eco, false];
+            let states = [q >= 0, bt == Some(true), air == Some(true), acc, eco, false, nosleep];
             let tiles = [
                 ("\u{E701}", "Wi‑Fi".to_string(), wsub),
                 ("\u{E702}", "Bluetooth".to_string(), onoff(bt)),
@@ -1240,6 +1244,7 @@ unsafe fn paint(hw: HWND, k: Kind) {
                 ("\u{E776}", t!("Спец. возможности", "Accessibility").to_string(), onoff(Some(acc))),
                 ("\u{E945}", t!("Экономия энергии", "Energy saver").to_string(), onoff(Some(eco))),
                 ("\u{E7F0}", t!("Субтитры", "Live captions").to_string(), String::new()),
+                ("\u{E708}", t!("Не спать", "No sleep").to_string(), onoff(Some(nosleep))),
             ];
             for (i, (glyph, label, sub)) in tiles.iter().enumerate() {
                 let (tl, tt) = (16 + 112 * (i as i32 % 3), 16 + 84 * (i as i32 / 3));
@@ -1272,8 +1277,8 @@ unsafe fn paint(hw: HWND, k: Kind) {
             }
             // sliders sit together on one card
             let n = sliders();
-            surface(dc, r(16, 184, w - 16, 192 + 44 * n), card, sc(18));
-            let mut y = 188;
+            surface(dc, r(16, 268, w - 16, 276 + 44 * n), card, sc(18));
+            let mut y = 272;
             let b = BRIGHT.load(Relaxed);
             if b >= 0 {
                 SelectObject(dc, f_glyph);
@@ -1846,13 +1851,21 @@ unsafe extern "system" fn proc(hw: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
 
 #[cfg(test)]
 mod tests {
-    use super::{flip_layout, score};
+    use super::{Act, Kind, flip_layout, score, size};
 
     #[test]
     fn layout_flip_both_ways() {
         assert_eq!(flip_layout("сркщьу"), "chrome");
         assert_eq!(flip_layout("ntktuhfv"), "телеграм");
         assert_eq!(flip_layout("vs code"), "мы сщву");
+    }
+
+    #[test]
+    fn quick_tiles_are_inside_the_panel() {
+        let (w, h) = size(Kind::Quick);
+        let tiles: Vec<_> = super::rects(Kind::Quick).into_iter().filter_map(|(rc, a)| matches!(a, Act::Tile(_)).then_some(rc)).collect();
+        assert_eq!(tiles.len(), 7);
+        assert!(tiles.iter().all(|rc| rc.right <= super::sc(w) && rc.bottom <= super::sc(h - 60)));
     }
 
     #[test]
